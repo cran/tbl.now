@@ -1,0 +1,60 @@
+Package: tbl.now
+Type: Package
+Title: Tidy Data and Workflow Layer for Epidemic Nowcasting
+Version: 1.0.0
+Authors@R: 
+    c(person("Rodrigo", "Zepeda-Tello", , "rzepeda17@gmail.com", role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0003-4471-5270")),
+      person("Rami", "Yaari", role = c("aut"),
+           comment = c(ORCID = "0000-0002-8808-8937")),
+      person("Matteo", "Perini", role = c("aut"),
+           comment = c(ORCID = "0000-0002-9465-6216")),
+      person("Teresa", "Yamana", role = c("ctb"),
+           comment = c(ORCID = "0000-0001-8349-3151")),
+      person("Jeffrey", "Shaman", role = c("ctb"),
+           comment = c(ORCID = "0000-0002-7216-7809")),
+      person(given = "Columbia University in the City of New York", role = c("cph", "fnd")))
+Description: Defines tidy data structures and package-agnostic workflows for
+    epidemiological nowcasting. The 'tbl_now' class records event, report, and
+    revision dates alongside strata, covariates, censoring, and
+    reporting-delay metadata while remaining compatible with 'dplyr'. Tools
+    support validation, manipulation, diagnostics, visualization, format
+    conversion, retrospective evaluation, and multiple modelling engines. The
+    'tbl_nowcast' class standardizes probabilistic predictions for plotting,
+    scoring, comparison, and ensembling.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+LazyDataCompression: xz
+Depends: R (>= 4.2.0)
+Suggests: almanac, baselinenowcast (>= 0.2.1), diseasenowcasting (>=
+        2.4.0), data.table, epidist (>= 0.4.1), EpiNow2 (>= 1.9.0),
+        epinowcast (>= 0.7.0), knitr, modifiedmk (>= 1.6.0), NobBS (>=
+        1.1.1), patchwork, plotly, rmarkdown, scoringutils (>= 2.0.0),
+        surveillance (>= 1.26.1), testthat (>= 3.0.0), tsibble, withr
+Additional_repositories: https://epinowcast.r-universe.dev,
+        https://davisvaughan.r-universe.dev,
+        https://rodrigozepeda.r-universe.dev
+Config/testthat/edition: 3
+Config/testthat/parallel: false
+Imports: cli, generics, grid, dplyr, ggplot2, lifecycle, lubridate,
+        methods, pillar, rlang, S7, scales, stats, tibble, tidyr,
+        tidyselect, utils
+URL: https://rodrigozepeda.github.io/tbl.now/,
+        https://github.com/RodrigoZepeda/tbl.now
+BugReports: https://github.com/RodrigoZepeda/tbl.now/issues
+VignetteBuilder: knitr
+Config/Needs/website: rmarkdown
+Config/roxygen2/version: 8.1.0
+NeedsCompilation: no
+Packaged: 2026-09-11 10:38:28 UTC; rodzepeda
+Author: Rodrigo Zepeda-Tello [aut, cre] (ORCID:
+    <https://orcid.org/0000-0003-4471-5270>),
+  Rami Yaari [aut] (ORCID: <https://orcid.org/0000-0002-8808-8937>),
+  Matteo Perini [aut] (ORCID: <https://orcid.org/0000-0002-9465-6216>),
+  Teresa Yamana [ctb] (ORCID: <https://orcid.org/0000-0001-8349-3151>),
+  Jeffrey Shaman [ctb] (ORCID: <https://orcid.org/0000-0002-7216-7809>),
+  Columbia University in the City of New York [cph, fnd]
+Maintainer: Rodrigo Zepeda-Tello <rzepeda17@gmail.com>
+Repository: CRAN
+Date/Publication: 2026-09-21 21:10:02 UTC

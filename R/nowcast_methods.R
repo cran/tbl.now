@@ -1,0 +1,1247 @@
+# The nowcasting backends that ship with tbl.now.
+#
+# Every backend is two S3 methods: `nowcast_fit.<method>()` runs the modelling
+# package (reusing the `tbl_now_to_*()` converters wherever one exists) and
+# `nowcast_tidy.<method>()` reshapes its output into the tidy quantile/draw
+# format documented in `?nowcast_tidy`.
+#
+# Each modelling package is an optional dependency, checked with `.need_pkg()`
+# at fit time.
+
+# Shared helpers -----
+
+#' Run an expression, silencing it unless the user asked for chatter
+#'
+#' @param expr The expression to evaluate.
+#' @param verbose Logical; when `FALSE` messages and warnings are suppressed.
+#'
+#' @return The value of `expr`.
+#'
+#' @keywords internal
+#' @noRd
+.quietly_if <- function(expr, verbose) {
+  if (isTRUE(verbose)) {
+    return(force(expr))
+  }
+  # MESSAGES and STDOUT only. Warnings are not chatter: the converters use them
+  # to say that strata were pooled, a censoring flag was collapsed or declared
+  # covariates were dropped -- each of which changes what the model saw. Stan
+  # divergent-transition and low-ESS warnings are the same kind of signal, and
+  # suppressing any of it is how a fit comes back looking fine while answering
+  # a different question -- DEVELOPMENT_SKILL section 9's `1e8` incident.
+  #
+  # `suppressMessages()` alone is not enough: `surveillance::nowcast()` reports
+  # progress with `cat()` ("Building reporting triangle...", "No. cases: ..."),
+  # NobBS's JAGS backend emits "NOTE: Stopping adaptation..." on stderr, and
+  # several external constructors write to stdout rather than to R's condition
+  # system. Wrap them all so `verbose = FALSE` really is quiet -- BUT keep
+  # warnings, because `capture.output(type = "message")` catches the printed
+  # warning list too, and merely wrapping in `capture.output` would silence
+  # them along with the progress chatter. `withCallingHandlers()` collects
+  # warnings before they queue, so they can be re-signalled outside the
+  # capture and reach the caller.
+  captured <- new.env(parent = emptyenv())
+  captured$warnings <- list()
+  out <- NULL
+  utils::capture.output(
+    utils::capture.output(
+      withCallingHandlers(
+        out <- suppressMessages(force(expr)),
+        warning = function(w) {
+          captured$warnings[[length(captured$warnings) + 1L]] <- w
+          invokeRestart("muffleWarning")
+        }
+      ),
+      type = "message"
+    ),
+    type = "output"
+  )
+  for (w in captured$warnings) warning(conditionMessage(w), call. = FALSE)
+  out
+}
+
+#' Build the tidy draws frame from a `[draws x time]` matrix
+#'
+#' @param matrix_draws A numeric matrix with draws in rows and event times in
+#'   columns.
+#' @param event_dates The event dates, aligned with the columns.
+#' @param event_col Name to give the event-date column.
+#'
+#' @return A `tibble` with `event_col`, `.draw` and `.value`.
+#'
+#' @keywords internal
+#' @noRd
+.matrix_to_draws <- function(matrix_draws, event_dates, event_col) {
+  n_draws <- nrow(matrix_draws)
+  dplyr::tibble(
+    !!event_col := rep(event_dates, each = n_draws),
+    .draw = rep(seq_len(n_draws), times = ncol(matrix_draws)),
+    .value = as.vector(matrix_draws)
+  )
+}
+
+#' Warn that a backend cannot honour the declared strata
+#'
+#' @param x A `tbl_now` object.
+#' @param method Name of the method.
+#'
+#' @return `NULL`, invisibly.
+#'
+#' @keywords internal
+#' @noRd
+.warn_pooled_strata <- function(x, method) {
+  strata <- get_strata(x)
+  if (length(strata) > 0) {
+    cli::cli_warn(c(
+      "{.pkg {method}} cannot nowcast the declared strata {.val {strata}} here; \\
+       pooling over them.",
+      "i" = "Nowcast each stratum separately if you need stratified results."
+    ))
+  }
+  invisible(NULL)
+}
+
+#' Classify temporal effects for EpiNow2's built-in model options
+#'
+#' EpiNow2's series input has no covariate columns, but its observation model has
+#' a native weekly reporting effect. Map only the `tbl_now` specs that match that
+#' option; every other requested effect is unavailable through the built-in
+#' engine and must be reported before the converter drops the columns.
+#'
+#' @param x A `tbl_now`.
+#'
+#' @return A list with logical `report_week_effect` and character
+#'   `unsupported`.
+#'
+#' @keywords internal
+#' @noRd
+.epinow2_temporal_effect_support <- function(x) {
+  specs <- get_temporal_effects(x)
+  if (length(specs) == 0) {
+    return(list(report_week_effect = FALSE, unsupported = character(0)))
+  }
+
+  unsupported <- character(0)
+  report_week_effect <- FALSE
+
+  for (spec in specs) {
+    effects <- spec$t_effects
+    where <- spec$date_type
+    requested <- character(0)
+    if (isTRUE(effects@day_of_week)) requested <- c(requested, "day_of_week")
+    if (isTRUE(effects@weekend)) requested <- c(requested, "weekend")
+    if (isTRUE(effects@day_of_month)) requested <- c(requested, "day_of_month")
+    if (isTRUE(effects@month_of_year)) requested <- c(requested, "month_of_year")
+    if (isTRUE(effects@week_of_year)) requested <- c(requested, "week_of_year")
+    if (length(effects@holidays) > 0) requested <- c(requested, "holidays")
+    if (length(effects@holiday_lags) > 0 && any(effects@holiday_lags > 0)) {
+      requested <- c(requested, "holiday_lags")
+    }
+    if (length(effects@weekend_lags) > 0 && any(effects@weekend_lags > 0)) {
+      requested <- c(requested, "weekend_lags")
+    }
+    if (length(effects@seasons) > 0) requested <- c(requested, "seasons")
+
+    supported <- identical(where, "report_date") && "day_of_week" %in% requested
+    report_week_effect <- report_week_effect || supported
+    missing <- setdiff(requested, if (supported) "day_of_week" else character(0))
+    if (length(missing) > 0) {
+      unsupported <- c(unsupported, paste0(missing, " on ", where))
+    }
+  }
+
+  list(
+    report_week_effect = report_week_effect,
+    unsupported = unique(unsupported)
+  )
+}
+
+#' Add EpiNow2 temporal-effect model options to the backend arguments
+#'
+#' @param args Arguments about to be passed to EpiNow2.
+#' @param x Source `tbl_now`.
+#'
+#' @return Modified `args`.
+#'
+#' @keywords internal
+#' @noRd
+.epinow2_apply_temporal_effects <- function(args, x) {
+  support <- .epinow2_temporal_effect_support(x)
+
+  if (support$report_week_effect && is.null(args$obs)) {
+    args$obs <- EpiNow2::obs_opts(week_effect = TRUE)
+  } else if (support$report_week_effect && !is.null(args$obs)) {
+    # An explicit `obs =` wins by design (tests pin that), but the declared
+    # day-of-week effect then goes nowhere -- previously silently. The user has
+    # asked for it, so it has to be said out loud, exactly as
+    # `.warn_dropped_covariates()` does for the converters.
+    cli::cli_warn(c(
+      "{.pkg EpiNow2}: declared {.val day_of_week} effect on \\
+       {.field report_date} is not applied because {.arg obs} was set \\
+       explicitly.",
+      "i" = "The engine will not overwrite an explicit {.arg obs}; the \\
+             declared effect is dropped.",
+      "i" = "To apply it, pass {.code obs = EpiNow2::obs_opts(week_effect = \\
+             TRUE, ...)} yourself, or drop {.arg obs} to let the engine set it."
+    ))
+  }
+
+  if (length(support$unsupported) > 0) {
+    cli::cli_warn(c(
+      "{.pkg EpiNow2} cannot add some declared temporal effects through the
+       built-in engine.",
+      "i" = "Unavailable effect{?s}: {.val {support$unsupported}}.",
+      "i" = "Only report-date {.val day_of_week} maps to
+             {.code EpiNow2::obs_opts(week_effect = TRUE)}."
+    ))
+  }
+
+  args
+}
+
+# diseasenowcasting -----
+
+#' @rdname nowcast_fit
+#' @export
+nowcast_fit.diseasenowcasting <- function(engine, x, ...,
+                                          quantile_levels = nowcast_quantile_levels(),
+                                          verbose = TRUE) {
+  # GitHub-only: it is in no CRAN-style repository, so the default
+  # `install.packages(repos = ...)` hint `.need_pkg()` builds cannot install it.
+  .need_pkg(
+    "diseasenowcasting",
+    install = c(
+      'install.packages("pak")',
+      'pak::pkg_install("RodrigoZepeda/diseasenowcasting")'
+    )
+  )
+
+  # diseasenowcasting was built around `tbl_now`, so it reads the data type,
+  # strata, covariates and temporal effects straight off the object: NO
+  # conversion, and in particular no de-accumulation. It auto-detects
+  # `count-cumulative` via `get_data_type()` and switches to the
+  # signed-increment Skellam / SkNB likelihood, which models the running total
+  # directly -- including downward revisions, which de-accumulating would
+  # destroy.
+  #
+  # Automatic model selection belongs to `diseasenowcasting::nowcast()`, not this
+  # adapter. For `count-cumulative` data, diseasenowcasting consumes the signed
+  # changes in the cumulative trajectory and selects its default cumulative
+  # process unless the caller supplied `model(cumulative = cumulative_process(...))`.
+  #
+  # Everything is looked up at run time rather than written
+  # `diseasenowcasting::`. The package is GitHub-only and sits in no repository
+  # CRAN can resolve, so declaring it in `Suggests` makes
+  # `R CMD check --as-cran` report a dependency it cannot find, while NOT
+  # declaring it makes a literal `::` an undeclared import. `.need_pkg()` above
+  # has already established that it is installed.
+  nowcast <- getExportedValue("diseasenowcasting", "nowcast")
+  .quietly_if(nowcast(x, ..., quantile_levels = quantile_levels), verbose)
+}
+
+#' @rdname nowcast_tidy
+#' @export
+nowcast_tidy.diseasenowcasting <- function(engine, fit, x, ..., quantile_levels) {
+  prediction <- stats::predict(fit)
+
+  event_col <- get_event_date(x)
+  event_dates <- .diseasenowcasting_event_dates(prediction, x)
+  strata_cols <- get_strata(x) %||% character(0)
+  strata_levels <- S7::prop(prediction, "strata_levels")
+  strata_draws <- S7::prop(prediction, "strata_draws")
+
+  # The stratified draws come back as a [draws x time x stratum] array indexed by
+  # `strata_levels`. \pkg{diseasenowcasting} models ANY number of strata columns
+  # and labels each combination by joining the values with "|" -- one column
+  # gives "F", two give "F|N" -- so the label splits back into the declared
+  # columns.
+  stratified <- length(strata_cols) > 0 &&
+    !is.null(strata_draws) &&
+    length(dim(strata_draws)) == 3 &&
+    length(strata_levels) == dim(strata_draws)[3] &&
+    !identical(strata_levels, "all")
+
+  strata_values <- if (stratified) {
+    .split_strata_labels(strata_levels, strata_cols, sep = "|")
+  }
+
+  if (stratified && !is.null(strata_values)) {
+    n_draws <- dim(strata_draws)[1]
+    n_times <- dim(strata_draws)[2]
+    draws <- dplyr::tibble(
+      !!event_col := rep(rep(event_dates, each = n_draws), times = length(strata_levels)),
+      .draw = rep(seq_len(n_draws), times = n_times * length(strata_levels)),
+      .value = as.vector(strata_draws)
+    )
+    # One label per stratum, each repeated over every (draw, time) cell -- the
+    # order `as.vector()` unrolls the array in.
+    for (column in strata_cols) {
+      draws[[column]] <- rep(strata_values[[column]], each = n_draws * n_times)
+    }
+    return(list(predictions = NULL, draws = draws))
+  }
+
+  if (length(strata_cols) > 0) {
+    .warn_pooled_strata(x, "diseasenowcasting")
+  }
+
+  list(
+    predictions = NULL,
+    draws = .matrix_to_draws(S7::prop(prediction, "draws"), event_dates, event_col)
+  )
+}
+
+.diseasenowcasting_event_dates <- function(prediction, x) {
+  event_dates <- S7::prop(prediction, "event_dates")
+  if (!is.null(event_dates)) {
+    return(event_dates)
+  }
+
+  event_index <- S7::prop(prediction, "event_index")
+  if (is.null(event_index)) {
+    return(event_dates)
+  }
+
+  event_col <- get_event_date(x)
+  first_event <- min(x[[event_col]], na.rm = TRUE)
+  event_dates <- if (identical(get_event_units(x), "numeric")) {
+    first_event + as.integer(event_index)
+  } else {
+    .tbl_now_date_seq(first_event, get_now(x), get_event_units(x))[event_index + 1L]
+  }
+  if (is.integer(x[[event_col]])) event_dates <- as.integer(event_dates)
+  event_dates
+}
+
+# baselinenowcast -----
+
+#' @rdname nowcast_fit
+#' @export
+nowcast_fit.baselinenowcast <- function(engine, x, ..., draws = 1000,
+                                        delays_unit = NULL, max_delay = NULL,
+                                        strata_sharing = "none",
+                                        quantile_levels = nowcast_quantile_levels(),
+                                        verbose = TRUE) {
+  .need_pkg("baselinenowcast")
+  strata_cols <- get_strata(x) %||% character(0)
+
+  if (length(strata_cols) == 0) {
+    triangle <- .quietly_if(
+      tbl_now_to_baselinenowcast(
+        x, format = "matrix",
+        delays_unit = delays_unit, max_delay = max_delay, verbose = verbose
+      ),
+      verbose
+    )
+    .baselinenowcast_check_shape(triangle)
+    return(.quietly_if(
+      baselinenowcast::baselinenowcast(
+        triangle, output_type = "samples", draws = draws, ...
+      ),
+      verbose
+    ))
+  }
+
+  # `baselinenowcast` >= 0.2.1 accepts a long tidy data.frame with a
+  # `strata_cols` argument and returns one `baselinenowcast_df` with the strata
+  # columns still attached, so a stratified nowcast is one call rather than a
+  # per-stratum loop. That is also the shape needed for
+  # `strata_sharing = "delay" / "uncertainty"` -- estimating the delay PMF or
+  # uncertainty parameters once on the pooled data and applying them to each
+  # stratum -- which the loop could not express.
+  #
+  # Peek through `format = "triangle_list"` first, purely for the shape check:
+  # `.baselinenowcast_check_shape()` emits a friendlier "triangle too wide"
+  # message per stratum than the arithmetic error the fit would give. The
+  # reshape is cheap next to the fit itself.
+  triangles <- .quietly_if(
+    tbl_now_to_baselinenowcast(
+      x,
+      format = "triangle_list", delays_unit = delays_unit,
+      max_delay = max_delay, verbose = verbose
+    ),
+    verbose
+  )
+  labels <- .tbl_now_strata_label(
+    as.data.frame(attr(triangles, "strata_values")), strata_cols
+  )
+  for (i in seq_along(triangles)) {
+    .baselinenowcast_check_shape(triangles[[i]], stratum = labels[i])
+  }
+
+  # The long-format converter deliberately does not complete zeros (a tidy data
+  # frame has no grid). A line list has no row for an event period in which
+  # nothing was reported, so handing it straight to baselinenowcast would
+  # silently shorten the reference axis (#67). Complete first, then convert:
+  # `format = "triangle_list"` did this implicitly above, and the long format
+  # needs the same treatment before it feeds `baselinenowcast(strata_cols = )`.
+  if (identical(get_data_type(x), "linelist")) {
+    x <- suppressWarnings(complete_zeroes(to_count(x, to = "count-incidence")))
+  }
+  long_df <- .quietly_if(
+    tbl_now_to_baselinenowcast(
+      x, format = "long",
+      delays_unit = delays_unit, max_delay = max_delay, verbose = verbose
+    ),
+    verbose
+  )
+  resolved_delays_unit <- .baselinenowcast_delays_unit(x, delays_unit)
+
+  .quietly_if(
+    baselinenowcast::baselinenowcast(
+      long_df,
+      output_type = "samples", draws = draws,
+      strata_cols = strata_cols,
+      strata_sharing = strata_sharing,
+      delays_unit = resolved_delays_unit,
+      ...
+    ),
+    verbose
+  )
+}
+
+#' Refuse a reporting triangle that is too wide to be fitted, and say what to cap
+#'
+#' \pkg{baselinenowcast} needs more reference dates than it has delay columns:
+#' it spends `max_delay` of them estimating the delay distribution and keeps
+#' `n_min_retro_nowcasts` (2) back for the uncertainty model, so a triangle with
+#' as many delays as reference dates leaves nothing for either. Its own message
+#' for that is arithmetic ("112 reference times available and 114 are needed"),
+#' with no mention of the delay axis and nothing the reader can act on.
+#'
+#' A revision series makes this the DEFAULT shape rather than an edge case: a
+#' FluSight-style snapshot re-reports every past week in every snapshot, so the
+#' oldest event date carries a delay as long as the series and the triangle
+#' comes out square. Almost all of that width is zeros -- 99% of `flusight`
+#' Colorado's cases arrive within 2 weeks of a 112-week axis -- so the fix is to
+#' cap the axis, and the number worth capping it at is computable.
+#'
+#' @param triangle A `reporting_triangle`.
+#' @param stratum Stratum label, or `NULL` when the object is unstratified.
+#'
+#' @return `NULL`, invisibly. Aborts when the triangle cannot be fitted.
+#'
+#' @keywords internal
+#' @noRd
+.baselinenowcast_check_shape <- function(triangle, stratum = NULL) {
+  # `n_min_retro_nowcasts` is `baselinenowcast::allocate_reference_times()`'s
+  # own default, and this is the inequality it checks.
+  n_min_retro_nowcasts <- 2L
+  n_reference <- nrow(triangle)
+  n_delays <- ncol(triangle)
+  if (n_reference >= (n_delays - 1L) + n_min_retro_nowcasts) {
+    return(invisible(NULL))
+  }
+
+  # The delay covering 99% of everything reported -- the cut
+  # `baselinenowcast::truncate_to_quantile()` makes by default -- but never
+  # wider than the geometry allows. `max_delay` counts PERIODS, so a triangle of
+  # `n` columns holds delays 0 to n-1 and the feasible cap is `n_reference - 1`.
+  arrived <- cumsum(colSums(triangle, na.rm = TRUE))
+  total <- arrived[length(arrived)]
+  covering <- if (isTRUE(total > 0)) {
+    which(arrived >= 0.99 * total)[1]
+  } else {
+    NA_integer_
+  }
+  # `which()[1]` is `NA` when the running total is not monotone, which a
+  # redistributed negative increment can make it. Fall back to the widest cap
+  # the geometry allows rather than printing `max_delay = NA`.
+  if (is.na(covering)) {
+    covering <- n_delays
+  }
+  suggestion <- max(2L, min(as.integer(covering), n_reference - 1L))
+
+  # Built here rather than inside the `cli_abort()` string: a `\\` continuation
+  # renders literally inside cli's glue, so a multi-line expression in `{}` is a
+  # parse error rather than a message (DEVELOPMENT_SKILL section 9).
+  where <- if (is.null(stratum)) "" else paste0(" for stratum ", stratum)
+
+  cli::cli_abort(c(
+    "The reporting triangle is too wide to nowcast{where}: \\
+     {n_delays} delay column{?s} against {n_reference} reference date{?s}.",
+    "x" = "{.pkg baselinenowcast} needs at least \\
+           {(n_delays - 1L) + n_min_retro_nowcasts} reference dates for a \\
+           triangle this wide -- {n_delays - 1L} to estimate the delay \\
+           distribution and {n_min_retro_nowcasts} for the uncertainty model.",
+    "i" = "Cap the delay axis: \\
+           {.code engine_baselinenowcast(max_delay = {suggestion})} keeps \\
+           delays 0-{suggestion - 1L}, which is where 99% of the reported cases \\
+           are.",
+    "i" = "A snapshot (\"as of\") series is the usual cause: it re-reports \\
+           every past period in every snapshot, so the delay axis grows with \\
+           the series and almost all of it is zeros."
+  ))
+}
+
+#' @rdname nowcast_tidy
+#' @export
+nowcast_tidy.baselinenowcast <- function(engine, fit, x, ..., quantile_levels) {
+  event_col <- get_event_date(x)
+  strata_cols <- get_strata(x) %||% character(0)
+
+  # baselinenowcast's data.frame method returns a single `baselinenowcast_df`
+  # with the strata columns present as regular columns, so a stratified fit is
+  # tidied the same way as an unstratified one -- the extra columns are picked
+  # up alongside the samples and carry through to `run_nowcast()`'s draws frame.
+  samples <- dplyr::as_tibble(fit) |>
+    dplyr::filter(.data$output_type == "samples")
+
+  draws <- dplyr::tibble(
+    !!event_col := samples$reference_date,
+    .draw       = as.integer(samples$draw),
+    .value      = as.numeric(samples$pred_count)
+  )
+  if (length(strata_cols) > 0L) {
+    draws <- dplyr::bind_cols(
+      draws, samples[, strata_cols, drop = FALSE]
+    )
+  }
+
+  list(predictions = NULL, draws = draws)
+}
+
+# epinowcast -----
+
+#' @rdname nowcast_fit
+#' @export
+nowcast_fit.epinowcast <- function(engine, x, ..., preprocess_args = list(),
+                                   quantile_levels = nowcast_quantile_levels(),
+                                   verbose = TRUE) {
+  .need_pkg("epinowcast")
+
+  preprocessed <- .quietly_if(
+    do.call(
+      tbl_now_to_epinowcast,
+      c(list(x = x, verbose = verbose, quiet = !verbose), preprocess_args)
+    ),
+    verbose
+  )
+
+  .epinowcast_check_effects_wired(x, list(...))
+
+  .quietly_if(epinowcast::epinowcast(preprocessed, ...), verbose)
+}
+
+#' Warn if declared temporal effects were carried into the epinowcast metadata
+#' but not referenced in any module formula
+#'
+#' The converter attaches temporal-effect columns to `metareference` /
+#' `metareport`, but nothing auto-populates a module formula from them. When the
+#' engine is driven with a `reference` / `report` / `expectation` / `missing`
+#' that never mentions any of the effect columns, the fit runs without them --
+#' silently, from the caller's point of view. This looks at the formulas the
+#' caller passed in and warns for effects that are not referenced anywhere.
+#'
+#' Heuristic: each module argument is deparsed to text and searched for the
+#' effect column names as substrings. Cheap and catches the common case; it can
+#' be fooled by a formula that names an effect column but does not use it as a
+#' regressor, which is a false negative and harmless (the fit is what the user
+#' asked for).
+#'
+#' @param x The `tbl_now` handed to the engine.
+#' @param dots The `...` from `nowcast_fit.epinowcast()` (the module args).
+#'
+#' @return `NULL`, invisibly.
+#'
+#' @keywords internal
+#' @noRd
+.epinowcast_check_effects_wired <- function(x, dots) {
+  # Compute the effect column names the converter would emit. `x` may or may
+  # not have materialised them already; `.materialize_temporal_effects()` is
+  # idempotent and cheap, so use it either way.
+  cols <- .materialize_temporal_effects(x)$cols
+  if (length(cols) == 0L) {
+    return(invisible(NULL))
+  }
+
+  # epinowcast module args carrying formulas that can reference the columns.
+  module_names <- c("expectation", "reference", "report", "missing")
+  modules <- dots[intersect(names(dots), module_names)]
+
+  used <- if (length(modules) == 0L) {
+    character(0)
+  } else {
+    txt <- paste(
+      vapply(modules, function(a) paste(deparse(a), collapse = " "), character(1)),
+      collapse = " "
+    )
+    cols[vapply(cols, function(col) grepl(col, txt, fixed = TRUE), logical(1))]
+  }
+  unused <- setdiff(cols, used)
+  if (length(unused) == 0L) {
+    return(invisible(NULL))
+  }
+
+  cli::cli_warn(c(
+    "{.fn nowcast_fit.epinowcast}: {length(unused)} declared temporal-effect \\
+     column{?s} ({.val {unused}}) {?is/are} attached to the preprocessed \\
+     object but {?is/are} not referenced in any module formula.",
+    "i" = paste0(
+      "Reference {cli::qty(length(unused))}{?it/them} in a module formula, ",
+      "e.g. {.code reference = enw_reference(parametric = ~ 1 + ",
+      unused[[1]], ", distribution = \"lognormal\", data = pobs)}."
+    ),
+    "i" = "The fit will not see {cli::qty(length(unused))}{?it/them} otherwise."
+  ))
+  invisible(NULL)
+}
+
+#' @rdname nowcast_tidy
+#' @export
+nowcast_tidy.epinowcast <- function(engine, fit, x, ..., quantile_levels) {
+  event_col <- get_event_date(x)
+  strata_cols <- get_strata(x) %||% character(0)
+
+  samples <- tryCatch(
+    summary(fit, type = "nowcast_samples"),
+    error = function(e) NULL
+  )
+
+  if (!is.null(samples)) {
+    samples <- dplyr::as_tibble(samples)
+    strata_kept <- intersect(strata_cols, colnames(samples))
+    draws <- samples |>
+      dplyr::transmute(
+        # epinowcast works in data.table's `IDate`; bring it back to `Date` so
+        # the predictions join cleanly against the rest of the package.
+        !!event_col := as.Date(.data$reference_date),
+        dplyr::across(dplyr::all_of(strata_kept)),
+        .draw = as.integer(.data$.draw),
+        .value = as.numeric(.data$sample)
+      )
+    if (length(strata_kept) < length(strata_cols)) {
+      .warn_pooled_strata(x, "epinowcast")
+    }
+    return(list(predictions = NULL, draws = draws))
+  }
+
+  # No sample storage (e.g. `output_loglik = FALSE` fits): fall back to the
+  # quantile summary, which epinowcast can always produce. Pass `type` through
+  # explicitly rather than relying on `summary.epinowcast`'s default; the
+  # default is `"nowcast"` today, but naming it here keeps the intent visible.
+  summarised <- dplyr::as_tibble(
+    summary(fit, type = "nowcast", probs = quantile_levels)
+  )
+  strata_kept <- intersect(strata_cols, colnames(summarised))
+  quantile_map <- stats::setNames(
+    quantile_levels,
+    paste0("q", formatC(100 * quantile_levels, format = "g"))
+  )
+
+  predictions <- .wide_to_quantiles(
+    summarised |> dplyr::mutate(!!event_col := as.Date(.data$reference_date)),
+    group_cols = c(event_col, strata_kept),
+    quantile_map = quantile_map
+  )
+
+  list(predictions = predictions, draws = NULL)
+}
+
+# NobBS -----
+
+#' @rdname nowcast_fit
+#' @export
+nowcast_fit.NobBS <- function(engine, x, ..., specs = list(),
+                              quantile_levels = nowcast_quantile_levels(),
+                              verbose = TRUE) {
+  .need_pkg("NobBS")
+
+  # `NobBS()` counts ROWS. Handing it count data directly nowcasts 1,174 rows
+  # as 1,174 cases when they carry 50,160, with no error -- so the line list
+  # comes from the converter, which expands counts to one row per case and
+  # refuses any grid NobBS cannot model.
+  linelist <- .quietly_if(tbl_now_to_nobbs(x, verbose = verbose), verbose)
+
+  # NobBS reports whichever quantiles it is told about at fit time, so the
+  # requested levels have to be pushed into `specs`.
+  specs$quantiles <- specs$quantiles %||% quantile_levels
+
+  arguments <- list(
+    data = linelist,
+    now = get_now(x),
+    units = .nobbs_units(get_event_units(x)),
+    onset_date = "onset_date",
+    report_date = "report_date",
+    specs = specs,
+    ...
+  )
+
+  strata_cols <- get_strata(x) %||% character(0)
+
+  if (length(strata_cols) > 0) {
+    # `NobBS.strat()` takes ONE column name. Several strata are the interaction
+    # of those columns -- which is exactly what "nowcast each combination
+    # separately" means -- and `tbl_now_to_nobbs()` has already pasted them into
+    # its `strata` column. `nowcast_tidy.NobBS()` splits the label back apart.
+    arguments$strata <- "strata"
+    return(.quietly_if(do.call(NobBS::NobBS.strat, arguments), verbose))
+  }
+
+  .quietly_if(do.call(NobBS::NobBS, arguments), verbose)
+}
+
+#' @rdname nowcast_tidy
+#' @export
+nowcast_tidy.NobBS <- function(engine, fit, x, ..., quantile_levels) {
+  event_col <- get_event_date(x)
+  strata_cols <- get_strata(x) %||% character(0)
+
+  estimates <- dplyr::as_tibble(fit$estimates)
+
+  # `NobBS.strat()` calls the stratum column `stratum` (and repeats it as
+  # `stratum.1`), so map it back onto the name(s) the `tbl_now` declared. With
+  # several, the label is the " | "-joined interaction built in `nowcast_fit`.
+  if (length(strata_cols) > 0 && "stratum" %in% colnames(estimates)) {
+    estimates <- dplyr::select(estimates, -dplyr::any_of("stratum.1"))
+    if (length(strata_cols) == 1) {
+      estimates <- dplyr::rename(estimates, !!strata_cols := "stratum")
+    } else {
+      values <- .split_strata_labels(estimates$stratum, strata_cols)
+      if (is.null(values)) {
+        cli::cli_abort(
+          "Cannot split {.pkg NobBS}'s stratum labels back into
+           {.val {strata_cols}}."
+        )
+      }
+      estimates <- dplyr::bind_cols(
+        dplyr::select(estimates, -"stratum"), values
+      )
+    }
+  }
+
+  strata_kept <- intersect(strata_cols, colnames(estimates))
+
+  # NobBS names its quantile columns `q_<level>`.
+  quantile_columns <- grep("^q_", colnames(estimates), value = TRUE)
+  quantile_map <- stats::setNames(
+    as.numeric(sub("^q_", "", quantile_columns)),
+    quantile_columns
+  )
+
+  predictions <- .wide_to_quantiles(
+    estimates |> dplyr::rename(!!event_col := "onset_date"),
+    group_cols = c(event_col, strata_kept),
+    quantile_map = quantile_map
+  )
+
+  # `nowcast.post.samps` are draws for the `now` date only, so they cannot fill
+  # the `draws` slot (which must cover every event date).
+  list(predictions = predictions, draws = NULL)
+}
+
+# Reusing the `tidy()` methods -----
+#
+# Some backends report a point estimate and ONE interval, and nothing else --
+# `surveillance` reads its bounds off the `pi` slot, EpiNow2 off its
+# `lower_<pct>` / `upper_<pct>` columns. `R/tidy.R` already knows how to get
+# those out, including the width, and re-deriving that here is how the audited
+# bugs got in (a pooled `stratum = "all"`, a zero-width band quoted as 95%).
+# So these backends go through `tidy()` and `.tidy_to_predictions()` maps the
+# standard frame into the tidy quantile shape.
+
+#' Split a joined stratum label back into its columns
+#'
+#' Backends label a stratum by joining the declared values with a separator --
+#' \pkg{diseasenowcasting} uses `"|"`, this package's own `tidy()` methods and
+#' `NobBS.strat()` wrapper use `" | "`. Splitting is only safe when every label
+#' yields exactly as many pieces as there are columns; a stratum VALUE
+#' containing the separator breaks that, and silently mis-assigning strata is
+#' worse than refusing.
+#'
+#' This is the ONE splitter. `.epinow2_region()` is its inverse.
+#'
+#' @param labels Character vector of joined labels.
+#' @param strata_cols Character vector of declared stratum column names.
+#' @param sep The separator to split on, matched literally.
+#'
+#' @return A `tibble` with one column per stratum, `NULL` when there are no
+#'   strata or when the labels cannot be split unambiguously.
+#'
+#' @keywords internal
+#' @noRd
+.split_strata_labels <- function(labels, strata_cols, sep = " | ") {
+  if (length(strata_cols) == 0) {
+    return(NULL)
+  }
+  parts <- strsplit(as.character(labels), sep, fixed = TRUE)
+  if (any(lengths(parts) != length(strata_cols))) {
+    return(NULL)
+  }
+  values <- lapply(seq_along(strata_cols), function(i) {
+    vapply(parts, function(p) p[[i]], character(1))
+  })
+  dplyr::as_tibble(stats::setNames(values, strata_cols))
+}
+
+#' Turn a standard `tidy()` nowcast frame into tidy quantile predictions
+#'
+#' An engine that reports a median and one interval can express exactly three
+#' quantile levels: `0.5`, and the two tails implied by the interval's `level`.
+#' Anything else the caller asked for is not available, and inventing it would
+#' be an approximation dressed up as a quantile -- so it is dropped, with a
+#' warning naming what was lost.
+#'
+#' @param tidied A tibble from a `tidy()` method: `event_date`, `stratum`,
+#'   `estimate`, `conf.low`, `conf.high`, `level`.
+#' @param x The source `tbl_now`.
+#' @param quantile_levels The levels the caller asked for.
+#' @param engine Engine name, for the message.
+#'
+#' @return A list with `predictions` and `draws` (always `NULL`), as
+#'   [nowcast_tidy()] must return.
+#'
+#' @keywords internal
+#' @noRd
+.tidy_to_predictions <- function(tidied, x, quantile_levels, engine) {
+  event_col <- get_event_date(x)
+  strata_cols <- get_strata(x) %||% character(0)
+
+  level <- unique(stats::na.omit(tidied$level))
+  if (length(level) > 1) {
+    cli::cli_abort(
+      "{.pkg {engine}} reported intervals of different widths ({.val {level}}); \\
+       they cannot be expressed at one set of quantile levels."
+    )
+  }
+
+  base <- dplyr::tibble(
+    !!event_col := as.Date(tidied$event_date),
+    .estimate = as.numeric(tidied$estimate),
+    .lower = as.numeric(tidied$conf.low),
+    .upper = as.numeric(tidied$conf.high)
+  )
+  strata_values <- .split_strata_labels(tidied$stratum, strata_cols)
+  if (length(strata_cols) > 0 && is.null(strata_values)) {
+    cli::cli_abort(c(
+      "Cannot map {.pkg {engine}}'s stratum labels back onto {.val {strata_cols}}.",
+      "i" = "Labels are {.val { | }}-separated, so a stratum value containing
+             that separator cannot be split back apart."
+    ))
+  }
+  if (!is.null(strata_values)) base <- dplyr::bind_cols(base, strata_values)
+
+  # The median is always available; the tails only when the engine said how wide
+  # its interval is.
+  pieces <- list(
+    dplyr::mutate(base, .quantile_level = 0.5, .value = .data$.estimate)
+  )
+  if (length(level) == 1) {
+    # Rounded: `(1 - 0.8) / 2` is 0.09999999999999998, which then fails to match
+    # another member's exact 0.1 when the two are ensembled, and fails autoplot's
+    # symmetric-pair detection -- silently, as a missing interval rather than an
+    # error.
+    tail_level <- round((1 - level) / 2, 10)
+    pieces <- c(pieces, list(
+      dplyr::mutate(base, .quantile_level = tail_level, .value = .data$.lower),
+      dplyr::mutate(
+        base, .quantile_level = round(1 - tail_level, 10), .value = .data$.upper
+      )
+    ))
+  }
+
+  produced <- sort(unique(unlist(lapply(pieces, function(p) p$.quantile_level[1]))))
+  unavailable <- setdiff(quantile_levels, produced)
+  if (length(unavailable) > 0) {
+    # Built with paste0() rather than one cli string: a `\\` continuation inside
+    # a cli message breaks the plural marker that follows it.
+    cli::cli_warn(c(
+      paste0(
+        "{.pkg {engine}} reports a point estimate and one interval, so it ",
+        "cannot report level{?s} {.val {unavailable}}."
+      ),
+      "i" = "The nowcast carries the levels it has: {.val {produced}}."
+    ))
+  }
+
+  predictions <- dplyr::bind_rows(pieces) |>
+    dplyr::select(dplyr::all_of(c(event_col, strata_cols, ".quantile_level", ".value"))) |>
+    dplyr::arrange(dplyr::across(dplyr::all_of(
+      c(event_col, strata_cols, ".quantile_level")
+    )))
+
+  # A nowcast estimates what has already happened. Some back-ends also forecast:
+  # `EpiNow2::estimate_infections()` returns one period past the end of the data,
+  # so a weekly object comes back with an extra week beyond `now`. That row is a
+  # forecast, and keeping it here would put it in an ensemble alongside members
+  # that never predicted it -- where it is averaged over the one member that did
+  # and reported as the ensemble's own value.
+  predictions <- .drop_beyond_now(predictions, x, event_col, engine)
+
+  list(predictions = predictions, draws = NULL)
+}
+
+#' Drop predictions that fall after `now`
+#'
+#' @param predictions The long prediction frame.
+#' @param x The source `tbl_now`.
+#' @param event_col Name of the event-date column.
+#' @param engine Engine name, for the message.
+#'
+#' @return `predictions`, without rows after `get_now(x)`.
+#'
+#' @keywords internal
+#' @noRd
+.drop_beyond_now <- function(predictions, x, event_col, engine) {
+  now <- get_now(x)
+  if (is.null(now) || !nrow(predictions)) {
+    return(predictions)
+  }
+  beyond <- predictions[[event_col]] > now
+  if (!any(beyond, na.rm = TRUE)) {
+    return(predictions)
+  }
+  dropped <- sort(unique(predictions[[event_col]][beyond]))
+  cli::cli_inform(c(
+    "i" = "{.pkg {engine}} also forecast {length(dropped)} \\
+           {cli::qty(length(dropped))}date{?s} after {.field now} \\
+           ({.val {as.character(dropped)}}); dropping {cli::qty(length(dropped))}\\
+           {?it/them}.",
+    "i" = "A nowcast estimates what has already happened. Use the back-end \\
+           directly if you want its forecast."
+  ))
+  predictions[!beyond, , drop = FALSE]
+}
+
+# surveillance -----
+
+#' Split a `tbl_now` into one object per stratum
+#'
+#' \pkg{surveillance} and the other one-series engines have no strata argument,
+#' so a stratified nowcast is one fit per stratum. The names are the
+#' `" | "`-pasted labels the `tidy()` methods use, so the two ends agree.
+#'
+#' @param x A `tbl_now` object.
+#'
+#' @return A named list of `tbl_now` objects; a single `"all"` element when the
+#'   object declares no strata.
+#'
+#' @keywords internal
+#' @noRd
+.split_by_strata <- function(x) {
+  strata_cols <- get_strata(x) %||% character(0)
+  if (length(strata_cols) == 0) {
+    return(list(all = x))
+  }
+  # `.epinow2_region()` subsets columns, and a column subset of a `tbl_now`
+  # drops the protected ones and warns. It only needs the strata values, so hand
+  # it a bare data frame.
+  labels <- .epinow2_region(.strip_tbl_now(x), strata_cols)
+  # `split()` on a `tbl_now` emits a spurious dropped-protected-column warning;
+  # `filter()` has a `tbl_now` method and leaves the object intact.
+  stats::setNames(
+    lapply(unique(labels), function(label) {
+      dplyr::filter(x, labels == !!label)
+    }),
+    unique(labels)
+  )
+}
+
+#' @rdname nowcast_fit
+#' @export
+nowcast_fit.surveillance <- function(engine, x, ..., when = NULL, D = NULL,
+                                     fit_method = "bayes.notrunc.bnb",
+                                     control = list(),
+                                     quantile_levels = nowcast_quantile_levels(),
+                                     verbose = TRUE) {
+  .need_pkg("surveillance")
+
+  aggregate_by <- .surveillance_aggregate_by(get_event_units(x))
+  # `nowcast()` refuses a `now` that is not the first day of an epoch, and an
+  # epi week starts on a Sunday rather than surveillance's Monday. Snapping is
+  # what the back end does to the line list anyway; the estimates are shifted
+  # back onto the object's own weekday in `nowcast_tidy.surveillance()`.
+  # Calling the offset here also fails fast, before a fit, when the event dates
+  # are on no common weekday at all.
+  .surveillance_epoch_offset(x, aggregate_by)
+  now <- .surveillance_epoch_start(get_now(x), aggregate_by)
+  D <- D %||% .surveillance_max_delay(x)
+
+  # Both grids come from the WHOLE object, once, not from each stratum's own
+  # rows: a stratum whose first case arrived a fortnight later would otherwise
+  # start its own time axis a fortnight later, and its estimates would not line
+  # up with anyone else's. `get_surveillance_range()` also reaches the `now` even
+  # when the last days carry no reports -- which is exactly the situation being
+  # nowcast, and which `surveillance` cannot infer from a line list, because a
+  # line list has no way to say "zero".
+  grid <- get_surveillance_range(x, by = aggregate_by)
+  when <- when %||% get_surveillance_when(x, length = D + 1L, by = aggregate_by)
+
+  # `N.tInf.max` caps the support of the nowcast distribution, and
+  # `surveillance`'s own default is 300 -- smaller than a single period's count
+  # on any series of consequence. Exceeding it does not warn usefully: the fit
+  # dies with `subscript out of bounds`, which names nothing and sends you
+  # looking at the date grids. Scale it off the data instead.
+  n_max <- control$N.tInf.max %||% .surveillance_support(x)
+
+  fit_one <- function(stratum) {
+    # The converter expands counts to one row per case.
+    linelist <- .quietly_if(
+      tbl_now_to_surveillance(stratum, verbose = verbose), verbose
+    )
+    arguments <- utils::modifyList(
+      list(
+        now = now,
+        when = when,
+        data = linelist,
+        dEventCol = "dHospital", dReportCol = "dReport",
+        aggregate.by = aggregate_by, D = D, method = fit_method,
+        control = utils::modifyList(
+          list(dRange = grid, N.tInf.max = n_max), control
+        )
+      ),
+      list(...)
+    )
+    .quietly_if(do.call(surveillance::nowcast, arguments), verbose)
+  }
+
+  fits <- lapply(.split_by_strata(x), fit_one)
+  if (length(get_strata(x) %||% character(0)) == 0) {
+    return(fits[[1]])
+  }
+  structure(fits, class = "surveillance_strata")
+}
+
+#' An upper bound for `surveillance`'s nowcast distribution
+#'
+#' [surveillance::nowcast()]'s `control$N.tInf.max` is the largest case count the
+#' posterior may put mass on. Its default is `300`. That is fine for the package's
+#' own examples and far too small for most real series: a period whose count
+#' approaches it has its posterior silently truncated, and a period that exceeds
+#' it aborts with `subscript out of bounds` -- an error that names neither the
+#' argument nor the number.
+#'
+#' Ten times the largest observed period total leaves room for the nowcast to
+#' correct upwards while staying well inside what the sampler can enumerate.
+#'
+#' @param x A `tbl_now` object.
+#'
+#' @return A single integer, never below \pkg{surveillance}'s own default.
+#'
+#' @keywords internal
+#' @noRd
+.surveillance_support <- function(x) {
+  counted <- suppressWarnings(suppressMessages(
+    to_count(ungroup(x), to = "count-incidence")
+  ))
+  count_col <- get_case_count(counted)
+  totals <- if (is.null(count_col)) {
+    table(counted[[get_event_date(counted)]])
+  } else {
+    tapply(counted[[count_col]], counted[[get_event_date(counted)]], sum,
+           na.rm = TRUE)
+  }
+  largest <- suppressWarnings(max(as.numeric(totals), na.rm = TRUE))
+  if (!is.finite(largest)) {
+    return(300L)
+  }
+  max(300L, as.integer(ceiling(largest * 10)))
+}
+
+#' The maximum delay to give an engine that must be told one
+#'
+#' @param x A `tbl_now` object.
+#'
+#' @return A single integer.
+#'
+#' @keywords internal
+#' @noRd
+.surveillance_max_delay <- function(x) {
+  delays <- x[[".delay"]]
+  observed <- suppressWarnings(max(delays[is.finite(delays) & delays >= 0], na.rm = TRUE))
+  if (!is.finite(observed)) {
+    cli::cli_abort("Cannot derive {.arg D}: {.arg x} has no usable delays.")
+  }
+  as.integer(ceiling(observed))
+}
+
+#' @rdname nowcast_tidy
+#' @export
+nowcast_tidy.surveillance <- function(engine, fit, x, ..., quantile_levels) {
+  fits <- if (inherits(fit, "surveillance_strata")) fit else list(all = fit)
+
+  tidied <- dplyr::bind_rows(lapply(names(fits), function(label) {
+    one <- tidy(fits[[label]])
+    one$stratum <- label
+    one
+  }))
+
+  # An `stsNC` is indexed by its epoch starts -- Mondays on a weekly fit. Put
+  # the estimates back on the weekday the caller's event dates use, so they
+  # join the data they were fitted from.
+  aggregate_by <- .surveillance_aggregate_by(get_event_units(x))
+  tidied$event_date <- as.Date(tidied$event_date) +
+    .surveillance_epoch_offset(x, aggregate_by)
+
+  .tidy_to_predictions(tidied, x, quantile_levels, "surveillance")
+}
+
+# EpiNow2 -----
+
+#' @rdname nowcast_fit
+#' @export
+nowcast_fit.EpiNow2 <- function(engine, x, ..., convert_args = list(), # nolint: object_name_linter.
+                                quantile_levels = nowcast_quantile_levels(),
+                                verbose = TRUE) {
+  .need_pkg("EpiNow2")
+  strata_cols <- get_strata(x) %||% character(0)
+  engine_args <- engine$args
+  if ("convert_args" %in% names(engine_args) && identical(convert_args, list())) {
+    convert_args <- engine_args$convert_args
+  }
+  engine_args$convert_args <- NULL
+  args <- .epinow2_apply_temporal_effects(
+    utils::modifyList(engine_args, list(...)), x
+  )
+
+  # `estimate_infections()` is the entry point that produces a case nowcast;
+  # `regional_epinow()` is the same model run once per region, which is how
+  # EpiNow2 expresses strata. The other two targets fit a truncation and a delay
+  # distribution, neither of which is a nowcast (see `?tbl_now_EpiNow2`).
+  target <- if (length(strata_cols) > 0) "regional_epinow" else "estimate_infections"
+
+  series <- .quietly_if(
+    do.call(
+      tbl_now_to_EpiNow2,
+      c(list(x = x, target = target, verbose = verbose, quiet = !verbose), convert_args)
+    ),
+    verbose
+  )
+
+  if (target == "regional_epinow") {
+    return(.quietly_if(
+      do.call(EpiNow2::regional_epinow, c(list(series), args)), verbose
+    ))
+  }
+  .quietly_if(
+    do.call(EpiNow2::estimate_infections, c(list(series), args)), verbose
+  )
+}
+
+#' Reach the `estimate_infections` fit inside an EpiNow2 object
+#'
+#' \pkg{EpiNow2} 1.9.0 made `epinow()$estimates` **defunct** -- accessing it
+#' errors, so `regional[[region]]$estimates %||% regional[[region]]` blows up
+#' on the LHS before `%||%` can pick the RHS. The news for 1.9.0 says
+#' \dQuote{use the object directly (it now inherits from
+#' \code{estimate_infections})}, so the correct idiom is a class check first
+#' and only fall back to \code{$estimates} for older versions where an
+#' \code{epinow} object was a plain list holding the fit under that name.
+#'
+#' Also unwraps a `regional_epinow()` region block, which carries the fit
+#' under `$estimates` on older EpiNow2 and directly (inheriting from
+#' `estimate_infections`) on 1.9.0.
+#'
+#' @param x An `epinow`, `estimate_infections`, or region block.
+#'
+#' @return The `estimate_infections` fit, or `x` unchanged when it does not
+#'   look like a wrapper.
+#'
+#' @keywords internal
+#' @noRd
+.epinow2_unwrap <- function(x) {
+  if (is.null(x)) return(NULL)
+  # 1.9.0 path: an `epinow` object already IS an `estimate_infections`.
+  if (inherits(x, "estimate_infections")) return(x)
+  # Older-version path: unwrap only if a plain list carries `$estimates`, and
+  # only via `.subset2()`. Both the S3 `$` and `[[` methods on `epinow` were
+  # kept for the deprecation error path (`$.epinow` throws the defunct error;
+  # `[[.epinow` refuses `exact = TRUE`, breaking `getElement()`), so `.subset2()`
+  # -- which bypasses S3 dispatch -- is the only safe accessor.
+  if (is.list(x) && "estimates" %in% names(x)) {
+    inner <- .subset2(x, "estimates")
+    if (!is.null(inner)) return(inner)
+  }
+  x
+}
+
+#' The posterior samples of `reported_cases` from an EpiNow2 fit
+#'
+#' [EpiNow2::get_predictions()] reads the fit's own draws rather than the
+#' `lower_<pct>`/`upper_<pct>` summary. That is the difference between an engine
+#' that reports three numbers and one that reports a distribution, and it is why
+#' \pkg{EpiNow2} can honour arbitrary `quantile_levels` and join a
+#' `type = "linear_pool"` ensemble.
+#'
+#' Returns `NULL` rather than erroring when the fit is not a shape
+#' `get_predictions()` handles -- a mocked fit in a test, an older
+#' \pkg{EpiNow2}, a `regional_epinow()` block whose estimates were not kept --
+#' so the caller can fall back to the summary.
+#'
+#' @param fit An `estimate_infections` object (or something holding one).
+#' @param event_col Name to give the date column.
+#'
+#' @return A tibble of `<event_col>`, `.draw`, `.value`, or `NULL`.
+#'
+#' @keywords internal
+#' @noRd
+.epinow2_draws <- function(fit, event_col) {
+  if (!is.function(getExportedValue("EpiNow2", "get_predictions"))) {
+    return(NULL)
+  }
+  samples <- tryCatch(
+    suppressWarnings(suppressMessages(
+      EpiNow2::get_predictions(fit, format = "sample")
+    )),
+    error = function(e) NULL
+  )
+  if (is.null(samples) || !is.data.frame(samples) || nrow(samples) == 0) {
+    return(NULL)
+  }
+  if (!all(c("date", "sample", "predicted") %in% names(samples))) {
+    return(NULL)
+  }
+  dplyr::tibble(
+    !!event_col := as.Date(samples$date),
+    .draw = as.integer(samples$sample),
+    .value = as.numeric(samples$predicted)
+  )
+}
+
+#' @rdname nowcast_tidy
+#' @export
+nowcast_tidy.EpiNow2 <- function(engine, fit, x, ..., quantile_levels) { # nolint: object_name_linter.
+  event_col <- get_event_date(x)
+  strata_cols <- get_strata(x) %||% character(0)
+
+  # DRAWS, not the summary. `EpiNow2::get_predictions(format = "sample")` returns
+  # the posterior samples of `reported_cases`, so the quantiles are derived here
+  # like any other sample-based back-end. Reading the fit's `lower_<pct>` /
+  # `upper_<pct>` columns instead -- which is what this did before 0.27.0 --
+  # limited EpiNow2 to a median and the two tails of whatever `CrIs` it happened
+  # to be fitted with, so `quantile_levels` could not be honoured, `probs` was an
+  # error, and it could not join a linear pool.
+  draws <- if (length(strata_cols) == 0) {
+    .epinow2_draws(fit, event_col)
+  } else {
+    # `regional_epinow()` returns one block per region under `$regional`; each
+    # block is an `estimate_infections` on EpiNow2 1.9.0 (inheritance change,
+    # `epinow()$estimates` defunct) and a list wrapping `$estimates` on older
+    # versions. `.epinow2_unwrap()` picks the right one without tripping the
+    # defunct accessor.
+    regional <- fit$regional
+    pieces <- lapply(names(regional), function(region) {
+      one <- .epinow2_draws(.epinow2_unwrap(regional[[region]]), event_col)
+      if (is.null(one)) {
+        return(NULL)
+      }
+      labels <- .split_strata_labels(rep(region, nrow(one)), strata_cols)
+      if (is.null(labels)) NULL else dplyr::bind_cols(one, labels)
+    })
+    if (any(vapply(pieces, is.null, logical(1)))) NULL else dplyr::bind_rows(pieces)
+  }
+
+  if (is.null(draws)) {
+    # The summary path, kept as a fallback: `tidy()` reads the interval width off
+    # the fit's own columns, because `CrIs` is a user argument and assuming 0.95
+    # would be wrong for a default fit (which reports 0.9). It reports only the
+    # levels it has, and says so.
+    return(.tidy_to_predictions(tidy(fit), x, quantile_levels, "EpiNow2"))
+  }
+
+  # A nowcast estimates what has already happened, and EpiNow2 also forecasts one
+  # period past the end of the data. See `.drop_beyond_now()`.
+  draws <- .drop_beyond_now(draws, x, event_col, "EpiNow2")
+
+  list(predictions = NULL, draws = draws)
+}

@@ -1,0 +1,1022 @@
+# Tests for diagnose() and its component functions.
+#
+# Every fixture here plants ONE defect, deliberately, and the count is written
+# out next to it. A check that silently stops working must therefore fail
+# exactly one test, and the assertion must be about the defect that was
+# planted -- a duplicate-row test built from rows that differ in an *undeclared*
+# column, for instance, passes whether or not the key is right, so both
+# variants are asserted separately below.
+
+# The clean fixture ------------------------------------------------------------
+#
+#   event        report       gender   n
+#   2024-01-01   2024-01-01   F        2     delay 0
+#   2024-01-01   2024-01-03   M        1     delay 2
+#   2024-01-02   2024-01-04   M        3     delay 2
+#   2024-01-05   2024-01-05   F        4     delay 0
+#
+#   now = 2024-01-05, daily units, 10 cases.
+#
+#   Nothing here is out of order, missing, repeated, negative, off-grid or
+#   dated after `now`, so a clean run must produce no `error` and no `warning`.
+
+clean_frame <- function() {
+  data.frame(
+    onset  = as.Date(c("2024-01-01", "2024-01-01", "2024-01-02", "2024-01-05")),
+    report = as.Date(c("2024-01-01", "2024-01-03", "2024-01-04", "2024-01-05")),
+    gender = c("F", "M", "M", "F"),
+    n      = c(2L, 1L, 3L, 4L)
+  )
+}
+
+clean_tbl <- function(frame = clean_frame(), ...) {
+  tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    strata = "gender", data_type = "count-incidence",
+    now = as.Date("2024-01-05"), verbose = FALSE, ...
+  )
+}
+
+# The same fixture with ONE row out of order: row 3 is reported on 2024-01-01,
+# the day before its event.
+dirty_frame <- function() {
+  frame <- clean_frame()
+  frame$report[3] <- as.Date("2024-01-01") # event is 2024-01-02
+  frame
+}
+
+# One finding, as a plain list, so expectations read one field at a time.
+finding <- function(result, check, scope, stratum = "all") {
+  row <- result[result$check == check & result$scope == scope &
+                  result$stratum == stratum, ]
+  expect_equal(nrow(row), 1)
+  as.list(row)
+}
+
+# Schema -----------------------------------------------------------------------
+
+test_that("diagnose() returns the documented schema, in order", {
+  skip_on_cran()
+  result <- diagnose(clean_tbl())
+
+  expect_s3_class(result, "tbl_df")
+  expect_identical(
+    names(result),
+    c(
+      "check", "scope", "stratum", "status", "n_affected", "n_total",
+      "prop", "message", "hint", "rows"
+    )
+  )
+  expect_true(is.ordered(result$status))
+  expect_identical(
+    levels(result$status),
+    c("error", "warning", "note", "ok", "skipped")
+  )
+  expect_type(result$rows, "list")
+  expect_type(result$message, "character")
+})
+
+test_that("the findings are sorted worst first", {
+  skip_on_cran()
+  result <- diagnose(suppressWarnings(clean_tbl(dirty_frame())))
+
+  expect_false(is.unsorted(as.integer(result$status)))
+  # And the worst one really is at the top.
+  expect_equal(as.character(result$status[1]), "warning")
+})
+
+test_that("diagnose() is the bind_rows() of its components", {
+  ndata <- clean_tbl()
+
+  components <- dplyr::bind_rows(
+    diagnose_declarations(ndata),
+    diagnose_ordering(ndata),
+    diagnose_missing(ndata),
+    diagnose_duplicates(ndata),
+    diagnose_units(ndata),
+    diagnose_negatives(ndata),
+    diagnose_now(ndata),
+    diagnose_truncation(ndata),
+    diagnose_strata(ndata)
+  )
+  components <- dplyr::arrange(
+    components, .data$status, .data$check, .data$scope, .data$stratum
+  )
+
+  expect_equal(diagnose(ndata), components)
+})
+
+test_that("`checks` runs exactly the blocks it names", {
+  skip_on_cran()
+  ndata <- clean_tbl()
+
+  expect_equal(diagnose(ndata, checks = "units"), diagnose_units(ndata))
+  expect_setequal(diagnose(ndata, checks = "units")$check, "units")
+  expect_error(diagnose(ndata, checks = "nonsense"), "should be one of")
+})
+
+test_that("a clean object produces no error and no warning findings", {
+  skip_on_cran()
+  result <- diagnose(clean_tbl())
+
+  expect_equal(sum(result$status %in% c("error", "warning")), 0)
+  expect_equal(as.character(finding(result, "ordering", "event_to_report")$status), "ok")
+  expect_equal(as.character(finding(result, "duplicates", "key")$status), "ok")
+  expect_equal(as.character(finding(result, "units", "delay")$status), "ok")
+})
+
+test_that("diagnose() refuses anything that is not a tbl_now", {
+  expect_error(diagnose(mtcars), "tbl_now")
+  expect_error(diagnose_missing(mtcars), "tbl_now")
+})
+
+# Pre-flight -------------------------------------------------------------------
+
+test_that("a missing required attribute short-circuits to error rows", {
+  skip_on_cran()
+  broken <- clean_tbl()
+  attr(broken, "event_date") <- NULL
+
+  result <- diagnose(broken)
+
+  expect_setequal(result$check, "attributes")
+  expect_equal(as.character(unique(result$status)), "error")
+  expect_true(any(grepl("Missing required attribute", result$message)))
+})
+
+# Ordering ---------------------------------------------------------------------
+#
+# One row, and one only, has its report BEFORE its event.
+
+test_that("a report before its event is one warning naming that row", {
+  skip_on_cran()
+  ndata <- suppressWarnings(clean_tbl(dirty_frame()))
+
+  row <- finding(diagnose(ndata), "ordering", "event_to_report")
+
+  expect_equal(as.character(row$status), "warning")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$n_total, 4)
+  expect_equal(row$rows[[1]], 3L)
+  # The indices point back into the object the user is holding.
+  expect_true(ndata$report[row$rows[[1]]] < ndata$onset[row$rows[[1]]])
+})
+
+test_that("the revision timeline is checked on both of its legs", {
+  skip_on_cran()
+  frame <- clean_frame()
+  # Row 2 is revised the day BEFORE it was reported; row 4 is revised
+  # before the event happened, and has no report date at all, so only the
+  # transitive check can see it.
+  frame$result <- as.Date(c("2024-01-02", "2024-01-02", "2024-01-05", NA))
+  frame$outcome <- c("confirmed", "confirmed", "confirmed", "confirmed")
+  frame$result[4] <- as.Date("2024-01-04")
+  frame$report[4] <- NA
+  frame$onset[4] <- as.Date("2024-01-05")
+
+  ndata <- suppressWarnings(tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "count-incidence", now = as.Date("2024-01-05"),
+    verbose = FALSE
+  ))
+  result <- diagnose(ndata)
+
+  before_report <- finding(result, "ordering", "report_to_revision")
+  expect_equal(as.character(before_report$status), "warning")
+  expect_equal(before_report$n_affected, 1)
+  expect_equal(before_report$rows[[1]], 2L)
+
+  before_event <- finding(result, "ordering", "event_to_revision")
+  expect_equal(as.character(before_event$status), "note")
+  expect_equal(before_event$n_affected, 1)
+  expect_equal(before_event$rows[[1]], 4L)
+})
+
+test_that("the revision legs are skipped without a revision process", {
+  skip_on_cran()
+  result <- diagnose(clean_tbl())
+
+  expect_equal(
+    as.character(finding(result, "ordering", "report_to_revision")$status),
+    "skipped"
+  )
+})
+
+# Missing ----------------------------------------------------------------------
+
+test_that("NA counts are reported neutrally, NA dates are not", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$n[2] <- NA_integer_ # one unobserved cell
+  frame$gender[4] <- NA # one row with no stratum
+
+  ndata <- suppressWarnings(clean_tbl(frame))
+  result <- diagnose(ndata, by_strata = FALSE)
+
+  counts <- finding(result, "missing", "n")
+  expect_equal(as.character(counts$status), "note")
+  expect_equal(counts$n_affected, 1)
+  expect_equal(counts$rows[[1]], 2L)
+  # An NA count is CORRECT data: the cell has not been observed yet.
+  expect_match(counts$hint, "not yet observed")
+
+  strata <- finding(result, "missing", "gender")
+  expect_equal(strata$n_affected, 1)
+  expect_equal(strata$rows[[1]], 4L)
+
+  dates <- finding(result, "missing", "onset")
+  expect_equal(as.character(dates$status), "ok")
+})
+
+test_that("a missing event date is a warning, as it always has been", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$onset[1] <- NA
+
+  ndata <- suppressWarnings(clean_tbl(frame))
+  row <- finding(diagnose(ndata), "missing", "onset")
+
+  expect_equal(as.character(row$status), "warning")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$rows[[1]], 1L)
+})
+
+test_that("missingness is reported per stratum when there are strata", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$n[2] <- NA_integer_ # the NA is in an M row
+
+  result <- diagnose(suppressWarnings(clean_tbl(frame)), by_strata = TRUE)
+
+  expect_equal(finding(result, "missing", "n", stratum = "M")$n_affected, 1)
+  expect_equal(finding(result, "missing", "n", stratum = "F")$n_affected, 0)
+  expect_equal(finding(result, "missing", "n", stratum = "all")$n_affected, 1)
+})
+
+# Duplicates -------------------------------------------------------------------
+
+test_that("genuine repeats on the full key are found and named", {
+  skip_on_cran()
+  frame <- rbind(clean_frame(), clean_frame()[1, ]) # one exact repeat
+
+  ndata <- suppressWarnings(clean_tbl(frame))
+  row <- finding(diagnose(ndata), "duplicates", "key")
+
+  expect_equal(as.character(row$status), "warning")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$rows[[1]], 5L)
+  # These rows really are duplicates, so `distinct()` is the right advice.
+  expect_match(row$hint, "distinct")
+})
+
+test_that("rows split by an undeclared column are diagnosed as such", {
+  skip_on_cran()
+  # NOT the same defect: these two rows are genuinely distinct, they differ in
+  # a column the object was never told about. Advising `distinct()` here would
+  # delete real cases.
+  frame <- clean_frame()
+  frame$sex <- c("a", "a", "a", "a")
+  extra <- frame[1, ]
+  extra$sex <- "b"
+  frame <- rbind(frame, extra)
+
+  ndata <- suppressWarnings(clean_tbl(frame))
+  row <- finding(diagnose(ndata), "duplicates", "key")
+
+  expect_equal(as.character(row$status), "warning")
+  expect_equal(row$n_affected, 1)
+  expect_match(row$hint, "sex")
+  expect_false(grepl("distinct", row$hint))
+})
+
+# The clean fixture with a revision axis.
+#
+#   onset        report       result       outcome     gender  n
+#   2024-01-01   2024-01-03   NA           pending     F       1
+#   2024-01-01   2024-01-03   NA           pending     F       1
+#   2024-01-02   2024-01-04   2024-01-05   confirmed   M       3
+#   2024-01-02   2024-01-04   2024-01-05   confirmed   F       4
+#
+# Rows 1 and 2 are two PENDING cases in the same (event, report, gender) cell,
+# byte-identical except for a resolution neither has yet; they may still resolve
+# on different days, which is why they are not a repeat. Rows 3 and 4 differ
+# only in `gender`, so they repeat exactly when `gender` is left undeclared.
+pending_pair_frame <- function() {
+  data.frame(
+    onset   = as.Date(c("2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02")),
+    report  = as.Date(c("2024-01-03", "2024-01-03", "2024-01-04", "2024-01-04")),
+    result  = as.Date(c(NA, NA, "2024-01-05", "2024-01-05")),
+    outcome = c("pending", "pending", "confirmed", "confirmed"),
+    gender  = c("F", "F", "M", "F"),
+    n       = c(1L, 1L, 3L, 4L)
+  )
+}
+
+revision_tbl <- function(frame = pending_pair_frame(), ...) {
+  tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "count-incidence", now = as.Date("2024-01-05"),
+    verbose = FALSE, ...
+  )
+}
+
+test_that("two pending rows in one cell are not a repeat", {
+  skip_on_cran()
+  # The regression: `duplicated()` compares NA to NA as equal, so every pending
+  # row in a cell came out an "exact duplicate" of the others and `distinct()`
+  # would have deleted a real case.
+  ndata <- revision_tbl(strata = "gender")
+  row <- finding(diagnose(ndata), "duplicates", "key")
+
+  expect_equal(as.character(row$status), "ok")
+  expect_equal(row$n_affected, 0)
+  # The two rows that were left out are named, so the silence is not mistaken
+  # for the check having found nothing to look at.
+  expect_match(row$message, "2 rows were not compared")
+})
+
+test_that("declaring the revision axis is what makes those rows unique", {
+  skip_on_cran()
+  # Without a revision axis the same four rows really are two repeats: the
+  # exemption is the missing resolution, not the shape of the fixture.
+  frame <- pending_pair_frame()
+  frame$result <- NULL
+  frame$outcome <- NULL
+
+  ndata <- suppressWarnings(tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    strata = "gender", data_type = "count-incidence",
+    now = as.Date("2024-01-05"), verbose = FALSE
+  ))
+  row <- finding(diagnose(ndata), "duplicates", "key")
+
+  expect_equal(as.character(row$status), "warning")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$rows[[1]], 2L)
+})
+
+test_that("the duplicate message names the key it actually checked", {
+  skip_on_cran()
+  # It used to read "(onset, report)" whatever else was declared, which invited
+  # the reasonable objection that a declared revision date should have told
+  # those rows apart.
+  ndata <- revision_tbl(strata = "gender")
+  message <- finding(diagnose(ndata), "duplicates", "key")$message
+
+  for (column in c("onset", "report", "result", "outcome", "gender")) {
+    expect_match(message, column)
+  }
+  # `.revision_num` is the revision date in another unit, not a column the user
+  # declared.
+  expect_false(grepl(".revision_num", message, fixed = TRUE))
+})
+
+test_that("an undeclared column still splits cells when a revision axis is on", {
+  skip_on_cran()
+  # Rows 3 and 4 differ only in `gender`. Leave it undeclared and they repeat on
+  # a key with nothing missing in it, so the warning must still fire -- and the
+  # advice must be to declare `gender`, not to `distinct()` a real case away.
+  ndata <- suppressWarnings(revision_tbl())
+  row <- finding(diagnose(ndata), "duplicates", "key")
+
+  expect_equal(as.character(row$status), "warning")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$rows[[1]], 4L)
+  expect_match(row$hint, "gender")
+  expect_false(grepl("distinct", row$hint))
+})
+
+test_that("a genuine repeat is found among rows that were exempted", {
+  skip_on_cran()
+  # Both at once: two pending rows that must be exempted, and a fifth row that
+  # repeats row 3 on a complete key. Exempting the first pair must not hide the
+  # second.
+  frame <- rbind(pending_pair_frame(), pending_pair_frame()[3, ])
+
+  ndata <- suppressWarnings(revision_tbl(frame, strata = "gender"))
+  row <- finding(diagnose(ndata), "duplicates", "key")
+
+  expect_equal(as.character(row$status), "warning")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$rows[[1]], 5L)
+  expect_match(row$hint, "distinct")
+})
+
+test_that("the duplicate check can be switched off, and skips line lists", {
+  skip_on_cran()
+  ndata <- clean_tbl()
+
+  off <- finding(diagnose(ndata, warn_non_uniqueness = FALSE), "duplicates", "key")
+  expect_equal(as.character(off$status), "skipped")
+
+  linelist <- tbl_now(
+    clean_frame()[rep(1:4, clean_frame()$n), c("onset", "report", "gender")],
+    event_date = "onset", report_date = "report", strata = "gender",
+    data_type = "linelist", now = as.Date("2024-01-05"), verbose = FALSE
+  )
+  expect_equal(
+    as.character(finding(diagnose(linelist), "duplicates", "key")$status),
+    "skipped"
+  )
+})
+
+# Units ------------------------------------------------------------------------
+
+test_that("weekly dates on two weekday grids are found, with the fix named", {
+  skip_on_cran()
+  # Mondays for the event, Wednesdays for the report: the delay is then 2/7 of
+  # a week, which is what breaks a converter.
+  frame <- data.frame(
+    onset  = as.Date(c("2024-01-01", "2024-01-08", "2024-01-15")),
+    report = as.Date(c("2024-01-10", "2024-01-17", "2024-01-24")),
+    n      = c(1L, 2L, 3L)
+  )
+  # The fractional-delay warning here is what `diagnose()` is supposed to
+  # find below, not something to re-emit from the constructor.
+  ndata <- suppressWarnings(tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    data_type = "count-incidence", event_units = "weeks",
+    report_units = "weeks", now = as.Date("2024-01-24"), verbose = FALSE,
+    align_weeks = FALSE
+  ))
+  result <- diagnose(ndata)
+
+  grid <- finding(result, "units", "report_grid")
+  expect_equal(as.character(grid$status), "note")
+  expect_equal(grid$n_affected, 3)
+  expect_match(grid$hint, "align_weeks")
+
+  # The event column is on its own regular grid; only the pair disagrees.
+  expect_equal(as.character(finding(result, "units", "event_grid")$status), "ok")
+
+  # A `warning` since 0.31.0 (#63), not a note: the converters cannot read a
+  # fractional delay, and the package no longer creates one, so the only way in
+  # is this -- two date columns on different weekday grids.
+  fractional <- finding(result, "units", "delay")
+  expect_equal(as.character(fractional$status), "warning")
+  expect_equal(fractional$n_affected, 3)
+})
+
+test_that("revision units that differ from the report units are flagged", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$result <- frame$report + 1
+  frame$outcome <- "confirmed"
+
+  ndata <- tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "count-incidence",
+    now = as.Date("2024-01-06"), verbose = FALSE
+  )
+  attr(ndata, "revision_units") <- "weeks" # days everywhere else
+
+  row <- finding(diagnose(ndata), "units", "declared")
+  expect_equal(as.character(row$status), "note")
+  expect_match(row$message, "revision_units")
+  expect_match(row$message, "report_units")
+})
+
+test_that("units that agree are reported as ok", {
+  skip_on_cran()
+  row <- finding(diagnose(clean_tbl()), "units", "declared")
+
+  expect_equal(as.character(row$status), "ok")
+  expect_equal(row$n_affected, 0)
+})
+
+# Negatives --------------------------------------------------------------------
+
+test_that("a downward revision shows up as a negative increment", {
+  skip_on_cran()
+  # One event date, reported twice: the cumulative total goes 5 then 3, so the
+  # de-accumulated increment is -2. Exactly one negative.
+  frame <- data.frame(
+    onset  = as.Date(c("2024-01-01", "2024-01-01", "2024-01-02")),
+    report = as.Date(c("2024-01-01", "2024-01-02", "2024-01-02")),
+    n      = c(5L, 3L, 4L)
+  )
+  ndata <- tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    data_type = "count-cumulative", now = as.Date("2024-01-02"),
+    verbose = FALSE
+  )
+
+  row <- finding(diagnose(ndata), "negatives", "increment")
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 1)
+  # The indices would be the de-accumulated view's rows, not this object's.
+  expect_equal(row$rows[[1]], integer(0))
+})
+
+test_that("a negative incidence count names the row it is on", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$n[3] <- -2L
+
+  ndata <- clean_tbl(frame)
+  row <- finding(diagnose(ndata), "negatives", "count", stratum = "all")
+
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$rows[[1]], 3L)
+})
+
+test_that("a line list has no counts to go negative", {
+  skip_on_cran()
+  linelist <- tbl_now(
+    clean_frame()[rep(1:4, clean_frame()$n), c("onset", "report")],
+    event_date = "onset", report_date = "report", data_type = "linelist",
+    now = as.Date("2024-01-05"), verbose = FALSE
+  )
+
+  expect_equal(
+    as.character(finding(diagnose(linelist), "negatives", "count")$status),
+    "skipped"
+  )
+})
+
+# now --------------------------------------------------------------------------
+
+test_that("an event dated after now is a note naming the row", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$onset[2] <- as.Date("2024-02-01") # after now, and after its report
+
+  ndata <- suppressWarnings(clean_tbl(frame))
+  row <- finding(diagnose(ndata), "now", "event_date")
+
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$rows[[1]], 2L)
+})
+
+test_that("a revision after now is an error", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$result <- frame$report
+  frame$outcome <- "confirmed"
+  ndata <- tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "count-incidence", now = as.Date("2024-01-05"), verbose = FALSE
+  )
+  attr(ndata, "now") <- as.Date("2024-01-04")
+
+  row <- finding(diagnose(ndata), "now", "revision_date")
+  expect_equal(as.character(row$status), "error")
+  expect_equal(row$n_affected, 1)
+})
+
+test_that("the gap to now is read off the triangle, per stratum", {
+  skip_on_cran()
+  result <- diagnose(clean_tbl(), by_strata = TRUE)
+
+  # F reports up to 2024-01-05 = now; M's last event is 2024-01-02, three days
+  # earlier.
+  expect_equal(finding(result, "now", "now_gap_event", stratum = "F")$n_affected, 0)
+  expect_equal(finding(result, "now", "now_gap_event", stratum = "M")$n_affected, 3)
+})
+
+# Truncation -------------------------------------------------------------------
+
+test_that("recent event dates are reported as still filling in", {
+  skip_on_cran()
+  # Delays are 0 (6 cases) and 2 (4 cases), so the 95th percentile is 2 and the
+  # maturity cutoff is 2024-01-03. Exactly one event date (2024-01-05) is
+  # younger than that.
+  row <- finding(diagnose(clean_tbl(), by_strata = FALSE), "truncation", "event_date")
+
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 1)
+  expect_match(row$hint, "right-truncation")
+})
+
+test_that("an immature date younger than every observed delay is not 0% missing", {
+  skip_on_cran()
+  # 100 cases reported five days late, then three very recent ones reported
+  # same-day. The 95th percentile of the delay is 5, so those three sit past
+  # the cutoff -- but no mature case ever arrived that fast, so the arrival
+  # curve reads exactly zero and nothing can be divided by it. Summing those
+  # away used to report "an estimated 0% has not arrived", the opposite of the
+  # truth: none of it has.
+  old_events <- rep(seq(as.Date("2024-01-01"), by = "day", length.out = 50), each = 2)
+  recent <- as.Date(c("2024-02-22", "2024-02-23", "2024-02-24"))
+  frame <- data.frame(
+    onset  = c(old_events, recent),
+    report = c(old_events + 5, recent)
+  )
+  ndata <- tbl_now(frame,
+    event_date = "onset", report_date = "report", data_type = "linelist",
+    verbose = FALSE
+  )
+
+  row <- finding(diagnose_truncation(ndata), "truncation", "event_date")
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 3)
+  expect_match(row$message, "none of their eventual total has arrived")
+  expect_false(grepl("0%", row$message, fixed = TRUE))
+})
+
+# Strata -----------------------------------------------------------------------
+
+test_that("the smallest stratum is named rather than thresholded", {
+  skip_on_cran()
+  # F has 6 of the 10 cases, M has 4.
+  row <- finding(diagnose(clean_tbl()), "strata", "size", stratum = "M")
+
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 4)
+  expect_equal(row$n_total, 10)
+  expect_equal(row$prop, 0.4)
+  expect_match(row$message, "smallest stratum")
+})
+
+test_that("the sparsity finding carries its denominator and the pooled share", {
+  skip_on_cran()
+  # The grid runs from the first event to `now`, so a share on its own says
+  # nothing about the stratum until it is read against the object as a whole.
+  row <- finding(diagnose(clean_tbl()), "strata", "sparsity", stratum = "F")
+
+  expect_equal(as.character(row$status), "note")
+  # The grid is 2024-01-01 to 2024-01-05; F has cases on two of those days,
+  # and the pooled series on three.
+  expect_equal(row$n_total, 5)
+  expect_equal(row$n_affected, 3)
+
+  # The numerator has to arrive WITH its denominator -- "60% of the event dates
+  # are empty" is unreadable on its own -- and the denominator has to say what
+  # it is counting and over what span, or the reader cannot tell a sparse
+  # stratum from a grid that is finer than the data. Matched on those pieces
+  # rather than on one exact sentence, so rewording the finding does not fail
+  # the test that guards its content.
+  expect_match(row$message, "3 of the 5")
+  expect_match(row$message, "between the minimum event", fixed = TRUE)
+  expect_match(row$message, "2024-01-01", fixed = TRUE)
+  expect_match(row$message, "2024-01-05", fixed = TRUE)
+  expect_match(row$message, "carry no cases at all", fixed = TRUE)
+  expect_match(row$message, "60%", fixed = TRUE)
+  expect_match(row$message, "40% pooled", fixed = TRUE)
+  expect_match(row$message, "pooled over every stratum")
+  expect_match(row$hint, "aggregate_time_units", fixed = TRUE)
+})
+
+test_that("an unstratified object skips the stratum comparison", {
+  skip_on_cran()
+  ndata <- tbl_now(clean_frame(),
+    event_date = "onset", report_date = "report", case_count = "n",
+    data_type = "count-incidence", now = as.Date("2024-01-05"), verbose = FALSE
+  )
+
+  expect_equal(
+    as.character(finding(diagnose(ndata), "strata", "size")$status), "skipped"
+  )
+})
+
+test_that("pending revisions are counted, not thresholded away", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$result <- as.Date(c("2024-01-02", "2024-01-04", NA, NA))
+  frame$outcome <- c("confirmed", "confirmed", "pending", "pending")
+
+  ndata <- tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "count-incidence", now = as.Date("2024-01-05"), verbose = FALSE
+  )
+
+  # Rows 3 and 4 are pending: 3 + 4 = 7 of the 10 cases.
+  row <- finding(diagnose(ndata), "strata", "pending", stratum = "all")
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 7)
+  expect_equal(row$n_total, 10)
+})
+
+test_that("a missing revision date on a pending case is not reported", {
+  skip_on_cran()
+  # A pending case is DEFINED by having no revision date, so a note counting
+  # those NAs was counting the definition back at the user.
+  ndata <- revision_tbl(strata = "gender")
+  row <- finding(diagnose(ndata), "missing", "result")
+
+  expect_equal(as.character(row$status), "ok")
+  expect_equal(row$n_affected, 0)
+  # Saying "no missing values" about a column that has two would read as the
+  # check having failed to look.
+  expect_match(row$message, "2 of them")
+  expect_match(row$message, "pending")
+})
+
+test_that("a missing revision date on a resolved case is still reported", {
+  skip_on_cran()
+  frame <- pending_pair_frame()
+  frame$result[3] <- NA # confirmed, yet nothing came back
+
+  ndata <- revision_tbl(frame, strata = "gender")
+  row <- finding(diagnose(ndata), "missing", "result")
+
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 1)
+  expect_equal(row$rows[[1]], 3L)
+  expect_match(row$message, "pending")
+})
+
+test_that("the pending exemption is applied per stratum", {
+  skip_on_cran()
+  ndata <- revision_tbl(strata = "gender")
+
+  # Both pending rows are "F", so neither stratum has an unexplained NA.
+  for (label in c("all", "F", "M")) {
+    row <- finding(diagnose(ndata), "missing", "result", stratum = label)
+    expect_equal(as.character(row$status), "ok")
+  }
+  expect_match(
+    finding(diagnose(ndata), "missing", "result", stratum = "F")$message,
+    "2 of them"
+  )
+  # "M" has no missing revision date at all, so it gets the plain wording.
+  expect_match(
+    finding(diagnose(ndata), "missing", "result", stratum = "M")$message,
+    "No missing values"
+  )
+})
+
+test_that("the pooled pending note does not call the pool a stratum", {
+  skip_on_cran()
+  result <- diagnose(revision_tbl(strata = "gender"))
+
+  expect_match(finding(result, "strata", "pending")$message, "% of all cases")
+  expect_match(
+    finding(result, "strata", "pending", stratum = "F")$message,
+    "% of the stratum"
+  )
+})
+
+test_that("the pending message reads as prose in both of its branches", {
+  skip_on_cran()
+
+  pending_message <- function(frame) {
+    ndata <- tbl_now(frame,
+      event_date = "onset", report_date = "report", case_count = "n",
+      revision_date = "result", revision_type = "outcome",
+      data_type = "count-incidence", now = as.Date("2024-01-05"), verbose = FALSE
+    )
+    finding(diagnose(ndata), "strata", "pending", stratum = "all")$message
+  }
+
+  frame <- clean_frame()
+  frame$result <- as.Date(c("2024-01-02", "2024-01-04", NA, NA))
+  frame$outcome <- c("confirmed", "confirmed", "pending", "pending")
+  settled <- pending_message(frame)
+
+  # The regression: the "how overdue are they" clause was itself a deferred
+  # `.diagnose_text()`, interpolated into the outer template as `{against}`.
+  # cli deparsed the object, and the note read
+  # "... 3.4% of the stratum; list(list(args = list(...), envir = <environment>))."
+  expect_false(grepl("list(list(", settled, fixed = TRUE))
+  expect_false(grepl("<environment>", settled, fixed = TRUE))
+  expect_match(settled, "waited longer than the median turnaround")
+
+  # With nothing resolved there is no turnaround, and the other branch runs.
+  frame$result <- as.Date(rep(NA, 4))
+  frame$outcome <- rep("pending", 4)
+  open <- pending_message(frame)
+
+  expect_false(grepl("list(list(", open, fixed = TRUE))
+  expect_match(open, "[Nn]othing has been confirmed yet")
+})
+
+# Statistical tests ------------------------------------------------------------
+
+test_that("the statistical questions are left out entirely", {
+  skip_on_cran()
+  result <- diagnose(clean_tbl())
+
+  # Drift and batching are questions about a distribution: `diagnose_drift()`
+  # and `diagnose_batches()` answer them, and `diagnose()` does not mention
+  # them at all.
+  expect_false("signposts" %in% result$check)
+  expect_false(any(grepl("diagnose_drift|diagnose_batches", result$message)))
+})
+
+# Declarations -----------------------------------------------------------------
+
+test_that("an undeclared column is a note, with both ways out", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$sex <- c("a", "b", "a", "b")
+
+  ndata <- suppressWarnings(clean_tbl(frame))
+  row <- finding(diagnose(ndata), "declarations", "undeclared")
+
+  expect_equal(as.character(row$status), "note")
+  expect_equal(row$n_affected, 1)
+  expect_match(row$hint, "strata")
+  expect_match(row$hint, "to_count")
+})
+
+test_that("temporal effects that were never materialised are a note", {
+  skip_on_cran()
+  ndata <- add_temporal_effects(
+    clean_tbl(),
+    t_effects = temporal_effects(day_of_week = TRUE)
+  )
+
+  pending <- finding(diagnose(ndata), "declarations", "temporal_effects")
+  expect_equal(as.character(pending$status), "note")
+  expect_match(pending$hint, "compute_temporal_effects")
+
+  computed <- finding(
+    diagnose(compute_temporal_effects(ndata)),
+    "declarations", "temporal_effects"
+  )
+  expect_equal(as.character(computed$status), "ok")
+})
+
+test_that("attribute failures are errors, one row each", {
+  skip_on_cran()
+  broken <- clean_tbl()
+  attr(broken, "event_units") <- "fortnights"
+
+  row <- finding(diagnose(broken), "declarations", "event_units")
+  expect_equal(as.character(row$status), "error")
+  expect_match(row$message, "must be one of")
+})
+
+# validate_tbl_now() -----------------------------------------------------------
+#
+# The refactor moved validate_tbl_now()'s body onto the findings engine. These
+# tests exist to prove that what it EMITS did not change with it.
+
+test_that("validate_tbl_now() is silent and TRUE on a clean object", {
+  skip_on_cran()
+  ndata <- clean_tbl()
+
+  expect_silent(result <- validate_tbl_now(ndata))
+  expect_true(result)
+  expect_invisible(validate_tbl_now(ndata))
+})
+
+test_that("validate_tbl_now() still warns about the same things", {
+  skip_on_cran()
+  ndata <- suppressWarnings(clean_tbl(dirty_frame()))
+
+  expect_warning(validate_tbl_now(ndata), "report_date.*before.*event_date")
+})
+
+test_that("validate_tbl_now() still aborts on a structural error", {
+  skip_on_cran()
+  broken <- clean_tbl()
+  attr(broken, "now") <- NULL
+  expect_error(validate_tbl_now(broken), "Missing required attribute")
+
+  wrong_type <- clean_tbl()
+  attr(wrong_type, "data_type") <- "nonsense"
+  expect_error(validate_tbl_now(wrong_type), "data_type.*must be")
+})
+
+test_that("validate_tbl_now() keeps warn_non_uniqueness off by default", {
+  skip_on_cran()
+  frame <- rbind(clean_frame(), clean_frame()[1, ])
+  ndata <- suppressWarnings(clean_tbl(frame))
+
+  expect_silent(validate_tbl_now(ndata))
+  expect_warning(
+    validate_tbl_now(ndata, warn_non_uniqueness = TRUE), "Non-unique"
+  )
+  # diagnose() defaults it the other way round.
+  expect_equal(
+    as.character(
+      finding(quiet_messages(diagnose(ndata)), "duplicates", "key")$status
+    ),
+    "warning"
+  )
+})
+
+test_that("validate_tbl_now() reports the same-column case as a message", {
+  skip_on_cran()
+  frame <- clean_frame()
+  ndata <- quiet_messages(suppressWarnings(tbl_now(frame,
+    event_date = "onset", report_date = "onset", case_count = "n",
+    data_type = "count-incidence", now = as.Date("2024-01-05"), verbose = FALSE
+  )))
+
+  # A message, not a warning: it has always been one, and promoting it would
+  # change what tbl_now() does on data it has always accepted.
+  expect_message_quietly(validate_tbl_now(ndata), "same")
+  expect_equal(
+    as.character(
+      finding(
+        quiet_messages(diagnose(ndata)),
+        "declarations", "same_columns"
+      )$status
+    ),
+    "note"
+  )
+})
+
+test_that("validate_tbl_now() does not emit the notes diagnose() adds", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$sex <- c("a", "b", "a", "b") # an undeclared column: a note, never a warning
+
+  ndata <- suppressWarnings(clean_tbl(frame))
+
+  expect_silent(validate_tbl_now(ndata))
+  expect_equal(
+    as.character(
+      finding(quiet_messages(diagnose(ndata)), "declarations", "undeclared")$status
+    ),
+    "note"
+  )
+})
+
+test_that("validate_tbl_now() warns when a revision precedes its report", {
+  skip_on_cran()
+  frame <- clean_frame()
+  frame$result <- frame$report
+  frame$result[2] <- frame$report[2] - 1 # revised before it was reported
+  frame$outcome <- "confirmed"
+
+  ndata <- suppressWarnings(tbl_now(frame,
+    event_date = "onset", report_date = "report", case_count = "n",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "count-incidence", now = as.Date("2024-01-05"), verbose = FALSE
+  ))
+
+  expect_warning(validate_tbl_now(ndata), "revised BEFORE")
+})
+
+# Printing ---------------------------------------------------------------------
+
+test_that("a diagnosis prints its findings, not the tibble", {
+  skip_on_cran()
+  # `cli_*` writes to the MESSAGE stream, which `capture.output()` does not see
+  # and `message = FALSE` swallows. A print method has to reach stdout.
+  result <- diagnose(clean_tbl())
+  printed <- capture.output(print(result))
+
+  expect_true(any(grepl("Diagnosis of a", printed)))
+  expect_true(any(grepl("passed", printed)))
+  # The messages themselves, not just a count of them.
+  first_note <- result$message[result$status == "note"][1]
+  expect_true(any(vapply(printed, function(line) {
+    grepl(substr(first_note, 1, 30), line, fixed = TRUE)
+  }, logical(1))))
+  # And the whole text of a check that passed, once it is asked for.
+  expect_true(any(grepl(
+    "The declared units agree", capture.output(print(result, all = TRUE))
+  )))
+})
+
+test_that("errors, warnings and notes are spelled out; passes are counted", {
+  skip_on_cran()
+  result <- diagnose(suppressWarnings(clean_tbl(dirty_frame())))
+  printed <- capture.output(print(result))
+
+  warning_message <- result$message[result$status == "warning"][1]
+  expect_true(any(grepl("Warnings", printed)))
+  expect_true(any(vapply(printed, function(line) {
+    grepl(substr(warning_message, 1, 30), line, fixed = TRUE)
+  }, logical(1))))
+
+  # The `ok` rows are a one-line tally by default, and every one of them by
+  # request.
+  n_ok <- sum(result$status == "ok")
+  expect_true(any(grepl(paste0(n_ok, " passed:"), printed)))
+  expect_true(any(grepl(
+    "^Passed \\(", capture.output(print(result, all = TRUE))
+  )))
+})
+
+test_that("a diagnosis is still a tibble", {
+  skip_on_cran()
+  result <- diagnose(clean_tbl())
+
+  expect_s3_class(result, "tbl_df")
+  # The class survives the verbs, so a filtered diagnosis still prints as one.
+  expect_s3_class(dplyr::filter(result, status <= "note"), "tbl_now_diagnosis")
+  # And `as_tibble()` is the documented way back to the table.
+  expect_false(inherits(tibble::as_tibble(result), "tbl_now_diagnosis"))
+})
+
+test_that("dropping the schema columns falls back to the tibble", {
+  skip_on_cran()
+  # The class survives `select()`, and `diagnose(x) |> select(...)` is how the
+  # articles read a block. A report cannot be written from columns that are gone.
+  narrowed <- dplyr::select(diagnose(clean_tbl()), scope, status, message)
+  printed <- capture.output(print(narrowed))
+
+  expect_false(any(grepl("Diagnosis of a", printed)))
+  expect_true(any(grepl("A tibble", printed)))
+})
+
+test_that("an empty diagnosis says so", {
+  skip_on_cran()
+  empty <- diagnose(clean_tbl())[0, ]
+  printed <- capture.output(print(empty))
+
+  expect_true(any(grepl("No findings", printed)))
+})

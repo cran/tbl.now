@@ -1,0 +1,863 @@
+# The revision process: a third date, after the event and the report.
+#
+# The influenza shape is the one to keep in mind -- onset, then the medical
+# visit, then the laboratory result, which can come back either way. The tests
+# below are written against the failures that would actually bite:
+#
+#   * a retraction summed together with the case it retracts,
+#   * an outcome invented from a date that cannot imply one,
+#   * `now` left behind a revision that has already happened,
+#   * the attributes quietly lost by a dplyr verb.
+
+flu_fixture <- function(n_days = 10L, seed = 20260825L) {
+  set.seed(seed)
+  outcomes <- rep(c("confirmed", "confirmed", "retracted", "pending"), length.out = 4L * n_days)
+  cases <- data.frame(
+    onset = as.Date("2021-01-04") + rep(seq_len(n_days) - 1L, each = 4L),
+    visit = as.Date("2021-01-04") + rep(seq_len(n_days) - 1L, each = 4L) + 1L,
+    result = as.Date("2021-01-04") + rep(seq_len(n_days) - 1L, each = 4L) + 3L,
+    outcome = outcomes,
+    stringsAsFactors = FALSE
+  )
+  # A pending case has not been resolved, so it has no result date.
+  cases$result[cases$outcome == "pending"] <- as.Date(NA)
+
+  tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  )
+}
+
+test_that("a revision process is recorded on the object", {
+  flu <- flu_fixture()
+
+  expect_true(has_revision(flu))
+  expect_equal(get_revision_date(flu), "result")
+  expect_equal(get_revision_type(flu), "outcome")
+  expect_equal(get_revision_units(flu), "days")
+
+  # The generated pair, on the same anchor as the other numeric columns.
+  expect_true(all(c(".revision_num", ".revision_delay") %in% colnames(flu)))
+  resolved <- !is.na(flu$result)
+  expect_equal(
+    flu$.revision_delay[resolved],
+    (flu$.revision_num - flu$.report_num)[resolved]
+  )
+
+  # Protected, so removing one downgrades the object -- as `.delay` does.
+  expect_true(all(
+    c(".revision_num", ".revision_delay", "result", "outcome") %in%
+      get_protected_cols(flu)
+  ))
+})
+
+test_that("revision delay is measured in revision units even when axes differ", {
+  skip_on_cran()
+  x <- suppressWarnings(tbl_now(
+    data.frame(
+      onset = as.Date("2024-01-01") + 0:2,
+      visit = as.Date("2024-01-02") + 7 * (0:2),
+      result = as.Date("2024-01-09") + 7 * (0:2),
+      outcome = "confirmed"
+    ),
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    event_units = "days", report_units = "weeks", revision_units = "weeks",
+    data_type = "linelist", verbose = FALSE
+  ))
+
+  expect_equal(x$.revision_delay, rep(1, 3))
+})
+
+test_that("an object with no revision is unchanged", {
+  skip_on_cran()
+  plain <- tbl_now(
+    data.frame(
+      e = as.Date("2021-01-04") + 0:4, r = as.Date("2021-01-05") + 0:4
+    ),
+    event_date = "e", report_date = "r", data_type = "linelist", verbose = FALSE
+  )
+
+  expect_false(has_revision(plain))
+  expect_null(get_revision_date(plain))
+  expect_null(get_revision_units(plain))
+  expect_false(any(
+    c(".revision_num", ".revision_delay") %in% colnames(plain)
+  ))
+})
+
+test_that("a revision date with no outcome is NA, not a guess", {
+  skip_on_cran()
+  cases <- data.frame(
+    e = as.Date("2021-01-04") + 0:2,
+    r = as.Date("2021-01-05") + 0:2,
+    cf = as.Date("2021-01-06") + 0:2
+  )
+
+  # THE decision this guards: a date alone cannot say whether the test came
+  # back positive or negative. Calling it "confirmed" would invert the meaning
+  # of every negative result in the data.
+  expect_warning(
+    x <- tbl_now(cases,
+      event_date = "e", report_date = "r", revision_date = "cf",
+      data_type = "linelist", verbose = FALSE
+    ),
+    "cannot say whether"
+  )
+  expect_true(all(is.na(x[[get_revision_type(x)]])))
+})
+
+test_that("a case with no revision date is pending", {
+  skip_on_cran()
+  cases <- data.frame(
+    e = as.Date("2021-01-04") + 0:2,
+    r = as.Date("2021-01-05") + 0:2,
+    # Only ONE revision: a single date has no spacing to infer a grid from,
+    # so the units fall back to the report units rather than erroring.
+    cf = c(as.Date("2021-01-06"), NA, NA)
+  )
+  x <- suppressWarnings(tbl_now(cases,
+    event_date = "e", report_date = "r", revision_date = "cf",
+    data_type = "linelist", verbose = FALSE
+  ))
+
+  outcome <- x[[get_revision_type(x)]]
+  expect_equal(outcome[2:3], c("pending", "pending"))
+  expect_true(is.na(outcome[1]))
+})
+
+test_that("an unrecognised outcome is refused", {
+  skip_on_cran()
+  cases <- data.frame(
+    e = as.Date("2021-01-04") + 0:2, r = as.Date("2021-01-05") + 0:2,
+    cf = as.Date("2021-01-06") + 0:2,
+    ty = c("confirmed", "probable", "retracted")
+  )
+  expect_error(
+    tbl_now(cases,
+      event_date = "e", report_date = "r",
+      revision_date = "cf", revision_type = "ty",
+      data_type = "linelist", verbose = FALSE
+    ),
+    "unrecognised"
+  )
+})
+
+test_that("an outcome without a date is refused", {
+  skip_on_cran()
+  cases <- data.frame(
+    e = as.Date("2021-01-04") + 0:2, r = as.Date("2021-01-05") + 0:2,
+    ty = c("confirmed", "pending", "retracted")
+  )
+  expect_error(
+    tbl_now(cases,
+      event_date = "e", report_date = "r", revision_type = "ty",
+      data_type = "linelist", verbose = FALSE
+    ),
+    "without a"
+  )
+})
+
+# `now` -----------------------------------------------------------------------
+
+test_that("a revision moves `now` forward", {
+  skip_on_cran()
+  cases <- data.frame(
+    e = as.Date("2021-01-01") + 0:1,
+    r = as.Date("2021-01-02") + 0:1,
+    cf = as.Date("2021-01-10") + 0:1
+  )
+  x <- suppressWarnings(tbl_now(cases,
+    event_date = "e", report_date = "r", revision_date = "cf",
+    data_type = "linelist", verbose = FALSE
+  ))
+
+  # A revision is an observation: the as-of moment is the last thing
+  # anybody knew, not the last thing anybody reported.
+  expect_equal(get_now(x), as.Date("2021-01-11"))
+})
+
+test_that("a `now` behind the last revision is refused", {
+  skip_on_cran()
+  flu <- flu_fixture()
+  broken <- flu
+  attr(broken, "now") <- min(flu$result, na.rm = TRUE) - 1
+
+  expect_error(validate_tbl_now(broken), "AFTER")
+})
+
+test_that("the timeline is checked, not assumed", {
+  skip_on_cran()
+  cases <- data.frame(
+    e = as.Date("2021-01-04") + 0:2,
+    r = as.Date("2021-01-08") + 0:2,
+    cf = as.Date("2021-01-06") + 0:2, # revised BEFORE reported
+    ty = rep("confirmed", 3)
+  )
+  expect_warning(
+    tbl_now(cases,
+      event_date = "e", report_date = "r",
+      revision_date = "cf", revision_type = "ty",
+      data_type = "linelist", verbose = FALSE
+    ),
+    "revised BEFORE"
+  )
+})
+
+# Persistence -----------------------------------------------------------------
+
+test_that("the revision attributes survive dplyr verbs", {
+  skip_on_cran()
+  flu <- flu_fixture()
+
+  verbs <- list(
+    filter = dplyr::filter(flu, .data$outcome != "pending"),
+    mutate = dplyr::mutate(flu, extra = 1),
+    arrange = dplyr::arrange(flu, .data$onset),
+    slice = dplyr::slice(flu, 1:8)
+  )
+
+  for (name in names(verbs)) {
+    result <- verbs[[name]]
+    expect_true(is_tbl_now(result), label = paste0(name, " keeps tbl_now"))
+    expect_equal(
+      get_revision_date(result), "result",
+      label = paste0(name, " keeps revision_date")
+    )
+    expect_equal(
+      get_revision_type(result), "outcome",
+      label = paste0(name, " keeps revision_type")
+    )
+    expect_equal(
+      get_revision_units(result), "days",
+      label = paste0(name, " keeps revision_units")
+    )
+  }
+})
+
+test_that("tbl_now_attributes() lists the revision attributes", {
+  skip_on_cran()
+  # It used to diff against a DEFAULT tbl_now, which has none of the optional
+  # attributes -- so every optional attribute was silently missing from the
+  # listing, which is exactly what somebody uses this function to check.
+  listed <- names(tbl_now_attributes(flu_fixture()))
+  expect_true(all(
+    c("revision_date", "revision_type", "revision_units") %in% listed
+  ))
+})
+
+test_that("add / change / remove round-trip", {
+  cases <- data.frame(
+    e = as.Date("2021-01-04") + 0:4, r = as.Date("2021-01-05") + 0:4,
+    cf = as.Date("2021-01-06") + 0:4, other = as.Date("2021-01-07") + 0:4,
+    ty = rep("confirmed", 5)
+  )
+  plain <- tbl_now(cases,
+    event_date = "e", report_date = "r", data_type = "linelist", verbose = FALSE
+  )
+  expect_false(has_revision(plain))
+
+  added <- add_revision_date(plain, cf, ty)
+  expect_true(has_revision(added))
+  expect_equal(get_revision_date(added), "cf")
+
+  # Adding twice is a mistake worth naming.
+  expect_error(add_revision_date(added, other), "already has")
+
+  changed <- change_revision_date(added, other, ty)
+  expect_equal(get_revision_date(changed), "other")
+
+  removed <- remove_revision_date(changed)
+  expect_false(has_revision(removed))
+  expect_false(any(
+    c(".revision_num", ".revision_delay") %in% colnames(removed)
+  ))
+  # The user's own columns stay; only the generated ones go.
+  expect_true(all(c("cf", "other", "ty") %in% colnames(removed)))
+})
+
+# Counting --------------------------------------------------------------------
+
+test_that("to_count() keeps confirmed and retracted apart", {
+  skip_on_cran()
+  counts <- data.frame(
+    e = rep(as.Date("2021-01-04") + 0:2, each = 2),
+    r = rep(as.Date("2021-01-05") + 0:2, each = 2),
+    cf = rep(as.Date("2021-01-06") + 0:2, each = 2),
+    ty = rep(c("confirmed", "retracted"), 3),
+    n = c(5L, 2L, 6L, 1L, 7L, 3L)
+  )
+  x <- tbl_now(counts,
+    event_date = "e", report_date = "r", case_count = "n",
+    revision_date = "cf", revision_type = "ty",
+    data_type = "count-incidence", verbose = FALSE
+  )
+
+  aggregated <- suppressWarnings(suppressMessages(to_count(x, to = "count-incidence")))
+
+  # A case and its retraction share an (event, report) pair without being
+  # duplicates, so building this must not warn about non-uniqueness.
+  expect_no_warning(tbl_now(counts,
+    event_date = "e", report_date = "r", case_count = "n",
+    revision_date = "cf", revision_type = "ty",
+    data_type = "count-incidence", verbose = FALSE
+  ))
+
+  # THE failure: summing a case together with its own retraction. Six rows in,
+  # six rows out, totals untouched.
+  expect_equal(nrow(aggregated), 6L)
+  expect_equal(sum(aggregated$n), sum(counts$n))
+  expect_setequal(unique(aggregated$ty), c("confirmed", "retracted"))
+})
+
+test_that("the three counts answer three different questions", {
+  skip_on_cran()
+  flu <- flu_fixture(n_days = 3L)
+
+  reported <- get_latest_reported_cases(flu)
+  confirmed <- get_latest_revised_cases(flu, "confirmed")
+  net <- get_latest_revised_cases(flu, "net")
+
+  # Per day the fixture has 2 confirmed, 1 retracted, 1 pending.
+  expect_equal(unique(reported[["n"]]), 4)
+  expect_equal(unique(confirmed[["n"]]), 2)
+  expect_equal(unique(net[["n"]]), 1) # 2 confirmed - 1 retracted
+
+  # Net can go NEGATIVE, which is the whole point: a published cumulative total
+  # revises downward when cases are withdrawn.
+  withdrawn <- data.frame(
+    e = as.Date("2021-01-04") + c(0, 1),
+    r = as.Date("2021-01-05") + c(0, 1),
+    cf = as.Date("2021-01-06") + c(0, 1),
+    ty = c("retracted", "retracted")
+  )
+  x <- tbl_now(withdrawn,
+    event_date = "e", report_date = "r",
+    revision_date = "cf", revision_type = "ty",
+    data_type = "linelist", verbose = FALSE, warn_non_uniqueness = FALSE
+  )
+  expect_equal(get_latest_revised_cases(x, "net")[["n"]], c(-1, -1))
+  # Nothing was confirmed at all, so there is no row to return -- the
+  # reporting-axis getters drop an event date with nothing in it the same way.
+  expect_error(
+    get_latest_revised_cases(x, "confirmed"), "selected no cases"
+  )
+})
+
+test_that("the counting getters refuse an object with no revision", {
+  skip_on_cran()
+  plain <- tbl_now(
+    data.frame(e = as.Date("2021-01-04") + 0:2, r = as.Date("2021-01-05") + 0:2),
+    event_date = "e", report_date = "r", data_type = "linelist", verbose = FALSE
+  )
+  expect_error(get_latest_revised_cases(plain), "needs a revision process")
+  expect_error(get_nth_revised_cases(plain, 1), "needs a revision process")
+
+  # The reporting-axis getters still work; they just cannot filter on an
+  # outcome that is not there, and say so rather than pretending.
+  expect_warning(
+    pooled <- get_latest_reported_cases(plain, "confirmed"),
+    "no revision process"
+  )
+  expect_equal(pooled[["n"]], get_latest_reported_cases(plain)[["n"]])
+})
+
+# Does the delay depend on the outcome? ---------------------------------------
+
+test_that("diagnose_revision_delay() finds a difference that is really there", {
+  skip_on_cran()
+  # Retracted results deliberately take 5-6 days against the confirmed 1-2, so
+  # a test that cannot see this cannot see anything.
+  cases <- data.frame(
+    onset = as.Date("2021-01-04") + rep(0:19, each = 4),
+    visit = as.Date("2021-01-05") + rep(0:19, each = 4),
+    result = as.Date("2021-01-05") + rep(0:19, each = 4) +
+      rep(c(1, 2, 5, 6), times = 20),
+    outcome = rep(c("confirmed", "confirmed", "retracted", "retracted"), times = 20)
+  )
+  flu <- tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  )
+
+  result <- diagnose_revision_delay(flu)
+
+  expect_equal(nrow(result), 1L)
+  expect_equal(result$n_confirmed, 40L)
+  expect_equal(result$n_retracted, 40L)
+  expect_equal(result$median_confirmed, 1.5)
+  expect_equal(result$median_retracted, 5.5)
+  expect_equal(result$difference, -4)
+  expect_lt(result$p.value, 0.001)
+})
+
+test_that("no difference is reported when there is none", {
+  skip_on_cran()
+  cases <- data.frame(
+    onset = as.Date("2021-01-04") + rep(0:19, each = 4),
+    visit = as.Date("2021-01-05") + rep(0:19, each = 4),
+    # The SAME spread of delays for both outcomes. Two identical constants
+    # would make the test degenerate (NaN), which is not "no difference".
+    result = as.Date("2021-01-05") + rep(0:19, each = 4) +
+      rep(c(1, 4, 1, 4), times = 20),
+    outcome = rep(c("confirmed", "confirmed", "retracted", "retracted"), times = 20)
+  )
+  flu <- tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  )
+
+  result <- diagnose_revision_delay(flu)
+  expect_equal(result$difference, 0)
+  expect_gt(result$p.value, 0.05)
+})
+
+test_that("unusable delays are dropped and counted", {
+  skip_on_cran()
+  cases <- data.frame(
+    onset = as.Date("2021-01-04") + 0:5,
+    visit = as.Date("2021-01-10") + 0:5,
+    # Two rows are revised BEFORE they were reported: a negative delay.
+    result = as.Date("2021-01-12") + c(0, 1, -5, -6, 2, 3),
+    outcome = c(rep("confirmed", 3), rep("retracted", 3))
+  )
+  flu <- suppressWarnings(tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  ))
+
+  result <- diagnose_revision_delay(flu)
+  expect_equal(attr(result, "dropped"), 2L)
+  expect_equal(result$n_confirmed + result$n_retracted, 4L)
+})
+
+test_that("the comparison can be made within a stratum", {
+  cases <- data.frame(
+    onset = as.Date("2021-01-04") + rep(0:19, each = 4),
+    visit = as.Date("2021-01-05") + rep(0:19, each = 4),
+    result = as.Date("2021-01-05") + rep(0:19, each = 4) +
+      rep(c(1, 2, 5, 6), times = 20),
+    outcome = rep(c("confirmed", "confirmed", "retracted", "retracted"), times = 20),
+    site = rep(c("north", "south"), length.out = 80)
+  )
+  flu <- tbl_now(cases,
+    event_date = "onset", report_date = "visit", strata = "site",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  )
+
+  result <- diagnose_revision_delay(flu, by = "site")
+  expect_setequal(result$stratum, c("north", "south"))
+  expect_equal(nrow(result), 2L)
+})
+
+test_that("plot_delay_distribution() draws the revision axis", {
+  skip_if_not_installed("ggplot2")
+  flu <- flu_fixture(n_days = 20L)
+
+  # Same comparison `plot_revision_delay()` used to draw, on the panel that
+  # replaced it: the revision delays, split by how each case resolved.
+  panel <- plot_delay_distribution(flu, axis = "revision")
+  expect_s3_class(panel, "ggplot")
+  expect_setequal(
+    as.character(unique(panel$data$outcome)), c("confirmed", "retracted")
+  )
+  expect_true(all(panel$data$delay %in% flu$.revision_delay))
+  expect_false(any(is.na(panel$data$delay)))
+})
+
+test_that("plot_delay_distribution() drops the split when it cannot be taken", {
+  skip_if_not_installed("ggplot2")
+
+  # A two-date object has no outcomes to split by, and the same call still has
+  # to work on it.
+  dates <- as.Date("2021-01-01") + 0:19
+  two_date <- tbl_now(
+    data.frame(e = dates, r = dates + 1),
+    event_date = e, report_date = r, verbose = FALSE
+  )
+  panel <- plot_delay_distribution(two_date)
+  expect_s3_class(panel, "ggplot")
+  expect_false("outcome" %in% names(panel$data))
+
+  # ... and the revision axis is refused outright, because there is none: the
+  # panel is skipped with a warning, which leaves nothing to draw.
+  expect_warning(
+    expect_error(plot_delay_distribution(two_date, axis = "revision")),
+    "needs a revision process"
+  )
+})
+
+test_that("complete_zeroes() extends the grid to the revision-aware now", {
+  skip_on_cran()
+  counts <- data.frame(
+    e = as.Date("2021-01-01") + c(0, 1),
+    r = as.Date("2021-01-01") + c(1, 2),
+    cf = as.Date("2021-01-01") + c(2, 9),
+    n = c(1L, 1L)
+  )
+  x <- suppressWarnings(tbl_now(counts,
+    event_date = "e", report_date = "r", case_count = "n",
+    revision_date = "cf", data_type = "count-incidence", verbose = FALSE
+  ))
+  expect_equal(get_now(x), as.Date("2021-01-10"))
+
+  completed <- suppressWarnings(suppressMessages(complete_zeroes(x)))
+  expect_equal(max(completed$e), as.Date("2021-01-10"))
+})
+
+test_that("update() keeps the revision process and de-duplicates on it", {
+  skip_on_cran()
+  # `update.tbl_now()` de-duplicates on everything EXCEPT the generated
+  # columns. Adding `.revision_num`/`.revision_delay` to that generated
+  # set broke the call, which passed no object and so could not know they
+  # existed -- 16 tests went red. This is the case the fix exists for.
+  counts <- data.frame(
+    e = as.Date("2021-01-04") + 0:2,
+    r = as.Date("2021-01-05") + 0:2,
+    cf = as.Date("2021-01-06") + 0:2,
+    ty = rep("confirmed", 3),
+    n = c(1L, 2L, 3L)
+  )
+  x <- tbl_now(counts,
+    event_date = "e", report_date = "r", case_count = "n",
+    revision_date = "cf", revision_type = "ty",
+    data_type = "count-incidence", verbose = FALSE
+  )
+
+  # Updating with the same rows must not duplicate them...
+  same <- suppressWarnings(suppressMessages(update(x, new_data = counts)))
+  expect_equal(nrow(same), nrow(x))
+  expect_true(has_revision(same))
+  expect_equal(get_revision_date(same), "cf")
+  expect_equal(get_revision_type(same), "ty")
+
+  # ...and a genuinely new row must arrive.
+  extra <- data.frame(
+    e = as.Date("2021-01-08"), r = as.Date("2021-01-09"),
+    cf = as.Date("2021-01-10"), ty = "retracted", n = 4L
+  )
+  grown <- suppressWarnings(suppressMessages(update(x, new_data = extra)))
+  expect_equal(nrow(grown), nrow(x) + 1L)
+  expect_true("retracted" %in% grown[["ty"]])
+})
+
+# The revision axis ------------------------------------------------------
+
+revision_axis_fixture <- function(seed = 7L) {
+  set.seed(seed)
+  days <- as.Date("2021-01-04") + 0:59
+  per_day <- stats::rpois(60, 6) + 2
+  onset <- rep(days, per_day)
+  cases <- data.frame(onset = onset, visit = onset + 1, result = onset + 3)
+  # A LABORATORY BACKLOG: a week of specimens all resolved on one day. Nothing
+  # unusual happens on the report axis -- reporting was regular throughout.
+  backlog <- cases$onset >= as.Date("2021-01-24") & cases$onset <= as.Date("2021-01-30")
+  cases$result[backlog] <- as.Date("2021-02-03")
+  cases$outcome <- "confirmed"
+
+  suppressWarnings(tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  ))
+}
+
+test_that("diagnose_batches() finds a laboratory backlog only on the revision axis", {
+  skip_on_cran()
+  x <- revision_axis_fixture()
+
+  on_report <- suppressWarnings(suppressMessages(diagnose_batches(x, lookback = 5)))
+  on_revision <- suppressWarnings(suppressMessages(
+    diagnose_batches(x, lookback = 5, axis = "revision")
+  ))
+
+  # The point of the option: reporting was regular, so the report axis sees
+  # nothing. The backlog is only visible where it happened.
+  expect_equal(sum(on_report$batch, na.rm = TRUE), 0L)
+  expect_equal(sum(on_revision$batch, na.rm = TRUE), 1L)
+
+  flagged <- on_revision[which(on_revision$batch), ]
+  expect_equal(flagged$report_date, as.Date("2021-02-03"))
+  # An order of magnitude above baseline, so this cannot pass by chance.
+  expect_gt(flagged$reported, 5 * flagged$baseline)
+})
+
+test_that("diagnose_batches2() uses report-to-revision delays on the revision axis", {
+  skip_on_cran()
+  x <- revision_axis_fixture()
+  release_date <- as.Date("2021-02-03")
+
+  shaped <- suppressWarnings(suppressMessages(
+    diagnose_batches2(
+      x, at = release_date, axis = "revision", guard = 3L,
+      n_permutations = 199L, seed = 1L
+    )
+  ))
+
+  expect_gt(shaped$n_at, 0L)
+  expect_gt(shaped$n_reference, 0L)
+  expect_gt(shaped$mean_delay_at, shaped$mean_delay_reference)
+  expect_lt(shaped$p_value, 0.05)
+})
+
+test_that("the revision axis needs a revision process", {
+  skip_on_cran()
+  plain <- suppressWarnings(tbl_now(
+    data.frame(
+      e = as.Date("2021-01-04") + rep(0:19, each = 3),
+      r = as.Date("2021-01-05") + rep(0:19, each = 3)
+    ),
+    event_date = "e", report_date = "r", data_type = "linelist", verbose = FALSE
+  ))
+  expect_error(
+    suppressWarnings(suppressMessages(diagnose_batches(plain, axis = "revision"))),
+    "needs a revision process"
+  )
+})
+
+test_that("pending cases are excluded from the revision axis", {
+  skip_on_cran()
+  # A pending case has no revision date, so counting it would invent an
+  # arrival on a date it does not have.
+  x <- flu_fixture(n_days = 20L)
+  increments <- tbl.now:::.batch_report_increments(x, axis = "revision")
+
+  resolved <- sum(!is.na(x[[get_revision_date(x)]]))
+  expect_equal(sum(increments$.count), resolved)
+  expect_lt(resolved, nrow(x))
+})
+
+test_that("the reporting-process plots accept the revision axis", {
+  skip_on_cran()
+  skip_if_not_installed("ggplot2")
+  x <- revision_axis_fixture()
+
+  for (fn in c("plot_reporting_process", "plot_epidemic_process",
+               "plot_reporting_hexamap")) {
+    drawn <- suppressWarnings(suppressMessages(
+      do.call(fn, list(x, axis = "revision"))
+    ))
+    expect_s3_class(drawn, "ggplot")
+  }
+})
+
+# The smaller analogues -------------------------------------------------------
+
+test_that("get_nth_revised_cases() counts by the delay from the EVENT", {
+  skip_on_cran()
+  cases <- data.frame(
+    onset = as.Date("2021-01-04") + 0:4,
+    visit = as.Date("2021-01-05") + 0:4,
+    # Report is one day after onset throughout, and the laboratory takes a
+    # further 0, 2, 1, 90 and 2 days -- so the delays from the EVENT, which is
+    # what this getter counts in, are 1, 3, 2, 91 and 3.
+    result = as.Date("2021-01-05") + 0:4 + c(0, 2, 1, 90, 2),
+    outcome = rep("confirmed", 5)
+  )
+  flu <- tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  )
+
+  expect_equal(get_latest_revised_cases(flu, "confirmed")[["n"]], rep(1, 5))
+
+  # Within one day of onset: only the case the laboratory turned round the day
+  # it was reported. The other event dates have nothing to report, so they are
+  # absent rather than zero -- as on the reporting axis.
+  within_one <- get_nth_revised_cases(flu, 1)
+  expect_equal(within_one[["n"]], 1)
+  expect_equal(within_one[["onset"]], as.Date("2021-01-04"))
+
+  # Within three days: everything except the 91-day straggler.
+  within_three <- get_nth_revised_cases(flu, 3)
+  expect_equal(within_three[["n"]], rep(1, 4))
+  expect_equal(within_three[["onset"]], as.Date("2021-01-04") + c(0, 1, 2, 4))
+
+  expect_error(get_nth_revised_cases(flu, "two"), "non-negative number")
+})
+
+test_that("censor_revision_delays_above() flags stragglers, keeping them", {
+  skip_on_cran()
+  cases <- data.frame(
+    onset = as.Date("2021-01-04") + 0:4,
+    visit = as.Date("2021-01-05") + 0:4,
+    result = as.Date("2021-01-05") + 0:4 + c(1, 2, 1, 90, 2),
+    outcome = rep("confirmed", 5)
+  )
+  flu <- tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  )
+
+  censored <- suppressMessages(censor_revision_delays_above(flu, 30))
+
+  # The flag is created when the object has none, exactly as on the report axis.
+  flag <- get_is_censored_revision(censored)
+  expect_identical(flag, ".is_censored_revision")
+  expect_identical(censored[[flag]], c(FALSE, FALSE, FALSE, TRUE, FALSE))
+
+  # Nothing is deleted and no outcome is rewritten: the delay is a bound, but
+  # the case was still confirmed, on the date it says.
+  expect_equal(sum(censored[["outcome"]] == "confirmed"), 5L)
+  expect_false(is.na(censored[["result"]][4]))
+  expect_equal(censored[[".revision_delay"]][4], 90)
+  expect_equal(sum(get_latest_revised_cases(censored, "confirmed")[["n"]]), 5)
+})
+
+test_that("censor_revision_delays_above() merges with existing flags", {
+  skip_on_cran()
+  cases <- data.frame(
+    onset = as.Date("2021-01-04") + 0:4,
+    visit = as.Date("2021-01-05") + 0:4,
+    result = as.Date("2021-01-05") + 0:4 + c(1, 2, 1, 90, 2),
+    outcome = rep("confirmed", 5)
+  )
+  flu <- tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  )
+
+  # Censor at 30, then again at a LOOSER threshold. A delay you have already
+  # refused to take at face value does not become exact because a later call
+  # was more permissive.
+  twice <- suppressMessages(
+    censor_revision_delays_above(
+      suppressMessages(censor_revision_delays_above(flu, 30)), 200
+    )
+  )
+  flag <- get_is_censored_revision(twice)
+  expect_identical(twice[[flag]], c(FALSE, FALSE, FALSE, TRUE, FALSE))
+})
+
+test_that("plot_revision_status() shows the resolution front", {
+  skip_if_not_installed("ggplot2")
+  x <- flu_fixture(n_days = 20L)
+
+  expect_s3_class(plot_revision_status(x), "ggplot")
+  expect_s3_class(plot_revision_status(x, proportion = FALSE), "ggplot")
+
+  plain <- tbl_now(
+    data.frame(e = as.Date("2021-01-04") + 0:4, r = as.Date("2021-01-05") + 0:4),
+    event_date = "e", report_date = "r", data_type = "linelist", verbose = FALSE
+  )
+  expect_error(plot_revision_status(plain), "needs a revision process")
+})
+
+test_that("align_weeks() aligns the revision date too", {
+  skip_on_cran()
+  weekly <- data.frame(
+    e = as.Date("2021-01-04") + 7 * (0:5),
+    r = as.Date("2021-01-06") + 7 * (0:5),
+    cf = as.Date("2021-01-09") + 7 * (0:5),
+    ty = rep("confirmed", 6), n = 2L
+  )
+  x <- suppressWarnings(tbl_now(weekly,
+    event_date = "e", report_date = "r", case_count = "n",
+    revision_date = "cf", revision_type = "ty",
+    data_type = "count-incidence", event_units = "weeks", report_units = "weeks",
+    verbose = FALSE
+  ))
+
+  # Three dates on three different weekdays give FRACTIONAL delays, which is
+  # exactly what this function exists to fix -- and it used to fix only two of
+  # them, leaving `.revision_delay` fractional.
+  expect_false(all(x$.delay == round(x$.delay)))
+  expect_false(all(x$.revision_delay == round(x$.revision_delay)))
+
+  aligned <- suppressWarnings(suppressMessages(align_weeks(x)))
+
+  expect_true(has_revision(aligned))
+  expect_true(all(aligned$.delay == round(aligned$.delay)))
+  expect_true(all(aligned$.revision_delay == round(aligned$.revision_delay)))
+})
+
+test_that("the delay family measures to the revision when asked", {
+  skip_on_cran()
+  # Every case is reported one period after onset and revised three periods
+  # after onset, so the revision delay itself is two periods from report.
+  x <- revision_axis_fixture()
+
+  on_report <- tbl.now:::.tbl_now_delay_long(x, NULL, axis = "report")
+  on_revision <- tbl.now:::.tbl_now_delay_long(x, NULL, axis = "revision")
+
+  expect_equal(stats::median(rep(on_report$delay, on_report$weight)), 1)
+  expect_equal(stats::median(rep(on_revision$delay, on_revision$weight)), 2)
+  expect_equal(
+    stats::median(rep(on_revision$delay, on_revision$weight)),
+    stats::median(x$.revision_delay)
+  )
+  # Revision delays are the report-to-revision turnaround, not the longer
+  # event-to-revision span.
+  expect_gt(sum(on_revision$delay * on_revision$weight),
+            sum(on_report$delay * on_report$weight))
+})
+
+test_that("the delay diagnostics accept the revision axis", {
+  skip_on_cran()
+  skip_if_not_installed("ggplot2")
+  skip_if_not_installed("modifiedmk")
+  x <- revision_axis_fixture()
+
+  quietly <- function(expr) suppressWarnings(suppressMessages(expr))
+
+  expect_s3_class(quietly(plot_reporting_triangle(x, axis = "revision")), "ggplot")
+  expect_s3_class(quietly(plot_delay_profiles(x, axis = "revision")), "ggplot")
+  expect_s3_class(quietly(plot_delay_drift(x, axis = "revision")), "ggplot")
+  expect_s3_class(quietly(diagnostic_plot(x, axis = "revision")), "ggplot")
+
+  expect_s3_class(quietly(diagnose_drift(x, axis = "revision")), "data.frame")
+  expect_s3_class(quietly(transport_discriminant(x, axis = "revision")), "data.frame")
+})
+
+test_that("the revision triangle is labelled as one", {
+  skip_on_cran()
+  skip_if_not_installed("ggplot2")
+  x <- revision_axis_fixture()
+
+  drawn <- suppressWarnings(suppressMessages(
+    plot_reporting_triangle(x, axis = "revision")
+  ))
+  expect_equal(drawn$labels$title, "Revision triangle")
+})
+
+test_that("simulate_batch() carries the revision through", {
+  skip_on_cran()
+  set.seed(3)
+  days <- as.Date("2021-01-04") + 0:39
+  onset <- rep(days, stats::rpois(40, 8) + 3)
+  cases <- data.frame(
+    onset = onset, visit = onset + 1, result = onset + 5,
+    outcome = "confirmed"
+  )
+  x <- suppressWarnings(tbl_now(cases,
+    event_date = "onset", report_date = "visit",
+    revision_date = "result", revision_type = "outcome",
+    data_type = "linelist", verbose = FALSE
+  ))
+
+  sim <- suppressWarnings(suppressMessages(
+    simulate_batch(x, closed_dates = as.Date("2021-01-20") + 0:2)
+  ))
+
+  expect_true(has_revision(sim))
+  expect_equal(get_revision_date(sim), "result")
+  expect_equal(nrow(sim), nrow(x))
+
+  # The mirror of the laboratory-backlog test: a simulated REPORTING backlog is
+  # found on the report axis and is correctly invisible on the revision
+  # axis, because the laboratory never paused.
+  on_report <- suppressWarnings(suppressMessages(diagnose_batches(sim)))
+  on_revision <- suppressWarnings(suppressMessages(
+    diagnose_batches(sim, axis = "revision")
+  ))
+  expect_gte(sum(on_report$batch, na.rm = TRUE), 1L)
+  expect_equal(sum(on_revision$batch, na.rm = TRUE), 0L)
+})

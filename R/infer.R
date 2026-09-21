@@ -1,0 +1,306 @@
+#' Automatically infer the `now`.
+#'
+#' Function returns the maximum onset date of `data` if `now = NULL`.
+#' Else it returns the `now` it was given.
+#'
+#'  @inheritParams tbl_now
+#'
+#' @return The `now` value for the nowcast which can be the last date
+#' of the data or specified by the user
+#'
+#' @examples
+#' # Get the maximum report date
+#' ddata <- data.frame(
+#'   event_date = c(as.Date("2020/07/08"), as.Date("2020/07/09")),
+#'   report_date = c(as.Date("2020/07/11"), as.Date("2020/07/12"))
+#' )
+#' infer_now(ddata, NULL, event_date = "event_date", report_date = "report_date")
+#'
+#' # Otherwise get the date given
+#' infer_now(ddata, as.Date("2020/07/11"),
+#'   event_date = "event_date",
+#'   report_date = "report_date"
+#' )
+#'
+#' @keywords internal
+#' @noRd
+infer_now <- function(data, now, event_date, report_date,
+                      revision_date = NULL) {
+  # Force conversion of data to avoid loops with dplyr_reconstruct
+  data <- dplyr::as_tibble(data)
+
+  # Check that the data frame is not empty
+  if (nrow(data) < 1) {
+    cli::cli_abort(
+      "{.arg data} is an empty data.frame with {nrow(data)} rows."
+    )
+  }
+
+  # Check that the columns are in the data.frame
+  check_date_columns(data, event_date, report_date)
+
+  # Now should be the last observed moment in time
+  if (is.null(now)) {
+    max_report_date <- data |>
+      dplyr::summarise(!!as.symbol("max") := max(!!as.symbol(report_date), na.rm = TRUE)) |>
+      dplyr::pull()
+
+    max_true_date <- data |>
+      dplyr::summarise(!!as.symbol("max") := max(!!as.symbol(event_date), na.rm = TRUE)) |>
+      dplyr::pull()
+
+    now <- max(max_report_date, max_true_date)
+
+    # A revision is an observation too, so it moves the as-of moment
+    # forward exactly as a report does.
+    if (!is.null(revision_date) && revision_date %in% colnames(data)) {
+      max_revision <- suppressWarnings(
+        max(data[[revision_date]], na.rm = TRUE)
+      )
+      if (is.finite(max_revision)) {
+        now <- max(now, max_revision)
+      }
+    }
+  }
+
+  return(now)
+}
+
+#' Automatically infer which value is `date_units` for one column.
+#'
+#' Function returns whether data is daily or weekly
+#' `date_column`.
+#'
+#'  @inheritParams tbl_now
+#'
+#' @param date_column Name of a column of `data`
+#' that contains the dates.
+#'
+#' @return Whether the data's date_units are `days`, `weeks`, `months`, `years` or `numeric`.
+#' @examples
+#' # Get the maximum report date and infer the data distribution
+#' daily_data <- data.frame(
+#'   event_date = c(as.Date("2020/07/08"), as.Date("2020/07/09"), as.Date("2020/07/10")),
+#'   report_date = c(as.Date("2020/07/11"), as.Date("2020/07/12"), as.Date("2020/07/14"))
+#' )
+#' infer_units_one_column(daily_data, NULL, "report_date")
+#'
+#' # Get the maximum report date and infer the data distribution
+#' weekly_data <- data.frame(
+#'   event_date = c(as.Date("2020/07/08"), as.Date("2020/07/15"), as.Date("2020/07/22")),
+#'   report_date = c(as.Date("2020/07/11"), as.Date("2020/07/18"), as.Date("2020/07/25"))
+#' )
+#' infer_units_one_column(weekly_data, NULL, "report_date")
+#'
+#' # Or just input the type
+#' infer_units_one_column(weekly_data, "weeks", "report_date")
+#'
+#' # Also works with numeric
+#' infer_units_one_column(data.frame(report_date = 1:20), date_units = "auto", "report_date")
+#' @keywords internal
+#' @noRd
+infer_units_one_column <- function(data, date_column, date_units) {
+  # Force conversion of data to avoid loops with dplyr_reconstruct
+  data <- dplyr::as_tibble(data)
+
+  valid_units <- c("days", "weeks", "months", "years", "numeric")
+
+  if (is.null(date_units) || date_units == "auto") {
+    if (nrow(data) < 2) {
+      cli::cli_abort(
+        "Cannot infer time units due to {.arg data}
+        having {nrow(data)} < 2 observations"
+      )
+    }
+
+    # Calculate the differences between consecutive dates. `NA` is dropped
+    # first: it is not a date, and counting it as a distinct one let a column
+    # holding one date plus missings past the guard below, where `diff()` gave
+    # `NA` and `min()` warned about its own empty arguments. A revision axis
+    # with pending cases is full of those missings.
+    date_vals <- data |>
+      dplyr::filter(!is.na(!!as.symbol(date_column))) |>
+      dplyr::distinct(!!as.symbol(date_column)) |>
+      dplyr::arrange(!!as.symbol(date_column)) |>
+      dplyr::pull(!!as.symbol(date_column))
+
+    # Check if they are date or numeric
+    if (lubridate::is.Date(date_vals)) {
+      # Fewer than two distinct dates have no spacing to read. Without this the
+      # `diff()` is empty, `min()` warns and returns `Inf`, and the abort below
+      # arrives behind a warning about `min` that says nothing about the data.
+      if (length(date_vals) < 2) {
+        seen <- if (length(date_vals) == 0) {
+          "no distinct dates"
+        } else {
+          "a single distinct date"
+        }
+        cli::cli_abort(c(
+          "Cannot infer time units: {.val {date_column}} has {seen}.",
+          "i" = "Declare them with {.arg units} (or {.arg event_units} /
+                 {.arg report_units}): one of {.val {setdiff(valid_units, 'numeric')}}."
+        ))
+      }
+
+      date_diffs <- date_vals |>
+        diff()
+
+      # Convert the differences to a period (days)
+      min_difference <- date_diffs |>
+        min(na.rm = TRUE) |>
+        as.numeric()
+
+      # Categorize based on the median difference
+      if (min_difference <= 6) {
+        date_units <- "days"
+      } else if (min_difference > 6 & min_difference <= 13) {
+        date_units <- "weeks"
+      } else if (min_difference >= 27 & min_difference <= 35) {
+        date_units <- "months"
+      } else if (min_difference >= 360 & min_difference <= 370) {
+        date_units <- "years"
+      } else {
+        cli::cli_abort(
+          "Cannot infer time units. Specify either `report_units` or `event_units` with the following options {.val {valid_units}}"
+        )
+      }
+    } else if (is.numeric(date_vals)) {
+      date_units <- "numeric"
+    } else {
+      cli::cli_abort(
+        "Date column {.val {date_column}} has to be either `numeric` or a `Date`"
+      )
+    }
+  } else if (!(date_units %in% valid_units)) {
+    cli::cli_abort(
+      "Date units {date_units} not supported yet. Try transforming them to `numeric` and using the `numeric` format."
+    )
+  }
+  return(date_units)
+}
+
+#' Automatically infer which value is `date_units`
+#'
+#' Function returns whether data is daily or weekly
+#' `date_column`.
+#'
+#'  @inheritParams tbl_now
+#'
+#' @return Whether the data's date_units are `days` or `weeks`.
+#'
+#' @keywords internal
+#' @noRd
+infer_units <- function(data, date_column, date_units) {
+  infer_units_one_column(data, date_units = date_units, date_column = date_column)
+}
+
+#' Automatically infer the `data_type`
+#'
+#' Infers whether the data is line-data or count-data whether it has (or has not)
+#' a column named `n`
+#'
+#' @inheritParams tbl_now
+#'
+#' @return Whether the data is `count` or `linelist`
+#'
+#' @keywords internal
+#' @noRd
+infer_data_type <- function(data, data_type, event_date, report_date, strata = NULL,
+                            is_censored_report = NULL, case_count = NULL, verbose = FALSE) {
+  if (!is.null(case_count) && length(case_count) != 1) {
+    cli::cli_abort("Invalid length = {length(case_count)} for `case_count`. It must be a vector of length 1.")
+  }
+  # Force conversion of data to avoid loops with dplyr_reconstruct
+  data <- dplyr::as_tibble(data)
+
+  # If data_type is vector keep the first entry
+  data_type <- data_type[1]
+
+  # Check that there is no column `n` if linedata and that there is if counts
+  if (data_type == "auto" && !is.null(case_count) && (case_count %in% colnames(data))) {
+    # Check that the data is different
+    distinct_data <- data |>
+      dplyr::distinct(dplyr::across(dplyr::all_of(c(event_date, report_date, strata, is_censored_report)))) |>
+      nrow()
+
+    if (distinct_data != nrow(data)) {
+      cli::cli_warn(
+        "Cannot accurately infer the data-type when rows are repeated across event and report dates"
+      )
+    }
+
+    # Check that data should be always increasing by strata, event date, report date
+    # for that purpose get the differences
+    summarized_difs <- data |>
+      dplyr::group_by(dplyr::across(dplyr::all_of(c(event_date, strata, is_censored_report)))) |>
+      dplyr::arrange(!!as.symbol(report_date)) |>
+      dplyr::mutate(!!as.symbol("difference") := !!as.symbol(case_count) - dplyr::lag(!!as.symbol(case_count))) |>
+      dplyr::filter(!is.na(!!as.symbol("difference"))) |>
+      dplyr::filter(!!as.symbol("difference") < 0) |>
+      nrow()
+
+    if (summarized_difs > 0) {
+      data_type <- "count-incidence"
+    } else {
+      data_type <- "count-cumulative"
+    }
+
+    # #Check that `n` column is really an integer
+
+    # if (!is.numeric(n_col) || any(ceiling(n_col) != n_col, na.rm = TRUE)){
+    #   cli::cli_abort(
+    #     paste0(
+    #       "Cannot automatically detect data_type. Data has a column named {.val {case_count}}",
+    #       "which does not seem to be count data (is not an integer).",
+    #       " Please set the {.code data_type} argument to either {.val count}",
+    #       " or {.val linelist}."
+    #     )
+    #   )
+    # }
+
+    # Look for missing values
+    n_col <- data |>
+      dplyr::filter(is.na(!!as.symbol(case_count))) |>
+      nrow()
+    if (n_col > 0) {
+      cli::cli_warn(
+        "Some observations in the count column {.val {case_count}} contain missing values."
+      )
+    }
+
+    if (verbose) {
+      cli::cli_alert_info(
+        paste0(
+          "Identified data as <{.emph {data_type}}> with counts in column {.val {case_count}}."
+        )
+      )
+    }
+  } else if (data_type == "auto" && (is.null(case_count) || !(case_count %in% colnames(data)))) {
+    data_type <- "linelist"
+    if (verbose) {
+      cli::cli_alert_info(
+        paste0(
+          "Identified data as <{.emph linelist-data}> where each observation is a test."
+        )
+      )
+    }
+  } else if (data_type == "linelist" && !is.null(case_count) && case_count %in% colnames(data)) {
+    cli::cli_warn(
+      paste0(
+        "Linelist data contains a column named {.val {case_count}} which will be overwritten.",
+        " If you are working with count-data set ",
+        "{.code data_type = {.val count-incidence}} or {.code data_type = {.val count-cumulative}}"
+      )
+    )
+  } else if (grepl("count", data_type) && !is.null(case_count) && !(case_count %in% colnames(data))) {
+    cli::cli_abort(
+      paste0(
+        "Count data should have a column named {.val {case_count}} with the number ",
+        "of tests per event_date-report_date combination. Otherwise set ",
+        "{.code data_type = {.val linelist}} if working with line-list data."
+      )
+    )
+  }
+
+  return(data_type)
+}
