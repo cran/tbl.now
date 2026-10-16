@@ -1,3 +1,150 @@
+# tbl.now 1.2.0
+
+## Breaking: calendar effects follow the calendar (#99)
+
+`temporal_effects(week_of_year = TRUE)`, `month_of_year = TRUE` and `seasons`
+were coded relative to the data rather than the calendar: the week and month
+were offsets from the date in the object's **first row** (so January was month
+3 for data starting in November, and the code even depended on row order), and
+the Fourier terms counted time from the earliest event date. The same calendar
+week therefore got a different code in every series, stratum and backtest
+window, and a coefficient labelled "week 7" was not epiweek 7.
+
+Now, on every date axis:
+
+* `month_of_year` is the calendar month: a factor with levels `1` (January) to
+  `12` (December).
+* `week_of_year` is the MMWR epidemiological week, [lubridate::epiweek()]: a
+  factor with levels `1` to `53`. Week 53, which only some years have, keeps a
+  level of its own instead of being folded into another week.
+* `seasons` count time from 1970-01-01 in the data's units, so a date gets the
+  same sine and cosine values whatever the first date of the series. Fourier
+  terms for report dates are still counted in the event units, as before. A
+  numeric (non-date) axis has no calendar and still counts from its first
+  event.
+
+Column names are unchanged, but their values change, so models refitted with
+these effects code them differently. A model's fit with Fourier `seasons`
+alone is unaffected in principle -- shifting the phase rotates the sine and
+cosine pair onto the same span -- while models with `week_of_year` or
+`month_of_year` now use January / epiweek 1, rather than the first period in
+the data, as the reference level. `tbl_now_to_epinowcast()` derives the
+effects on its completed grid from the calendar too, so its values match
+`compute_temporal_effects()` wherever the grid starts.
+`add_temporal_effects.data.frame()` no longer needs `numeric_col` for seasons on
+a date column (an explicit `numeric_col` still takes precedence) and gains
+`season_units`, the units the Fourier periods are counted in.
+
+## `nowcast_ensemble()` can take the median (#100)
+
+`nowcast_ensemble(type = "median")` combines the members' predictive quantiles
+by their median, level by level, as the COVID-19 and FluSight forecast hubs'
+quantile median ensembles do. One outlying member cannot drag it the way it
+drags the average (`type = "quantile"`). The `weights` still apply: any weights
+other than `"equal"`, including `"inverse_score"` and `"optim"` from a
+backtest, give a weighted median. With two equally weighted members the median
+equals the average, so it needs three or more to differ.
+
+## epidist comes from CRAN
+
+`epidist` in `Suggests` is now `>= 1.0.0`, its first CRAN release, so it
+installs without an extra repository. `tidy.epidist_fit()` uses the interface
+that epidist 0.5.0 introduced, `delay_parameter_draws()` and
+`add_summaries()`, in place of the removed `predict_delay_parameters()` and
+`add_mean_sd()`, which had made `tidy()` fail on every fit and `R CMD check`
+warn about missing objects. Because the new draws carry every column of the
+model data, all numeric, the reported terms are taken from the fit's family
+(`mu` and `sigma` for a lognormal, say) plus `mean` and `sd`, rather than from
+whatever numeric column is left after dropping a list of bookkeeping names.
+`baselinenowcast` in `Suggests` is relaxed to `>= 0.2.0`, the version on CRAN.
+
+## `diagnose()` reports fractional delays under `units` / `delay` again
+
+1.1.0 accidentally moved the fractional-`.delay` finding of `diagnose()` and
+`validate_tbl_now()` from scope `"delay"` to `"report"`. It is back under
+`"delay"`.
+
+# tbl.now 1.1.1
+
+## `simulate_batch()` works on older R versions
+
+`simulate_batch()` aborted with "Every report date is closed" on older R
+versions (seen on R 4.3.3) whatever `closed_dates` was, because `setdiff()`
+returns plain numbers there and `match()` cannot compare them with dates. The
+open dates are now recovered from their numeric values, which is correct on
+every R version.
+
+## `nowcast_backtest()` can resume, and backtests can be combined
+
+`nowcast_backtest()` gains `checkpoint_file` (#90). Each finished
+(engine, date) fit is saved to that file; running the same call again refits
+only the fits that are missing, and a fit that failed is retried. The file
+records a fingerprint of the data, `seed`, `keep_draws`, the truth settings and
+each engine, and a call that differs from it aborts rather than mixing fits from
+two backtests; new `now_dates` and new engines are added to it. Only the main R
+session writes the file (through a temporary file and a rename), so every
+`future::plan()` is safe with `parallel = TRUE`, which then runs and saves the
+fits in waves of `future::nbrOfWorkers()`.
+
+The new `backtest_combine()` joins backtests that were run separately (#91):
+different models on the same dates, the same model on new dates, or both. Combining
+what one call would have produced gives the same object as that call. It aborts
+when a (method, date) fit appears twice or when the backtests differ in strata,
+`truth_axis`, `truth_type`, `keep_draws` or quantile levels, and
+`only_common_dates = TRUE` keeps only the dates every method has.
+
+# tbl.now 1.1.0
+
+## Breaking: backtest methods are compared on the targets all of them scored
+
+When a fit failed in `nowcast_backtest()`, the backtest carried on and that
+method simply had fewer scores. `nowcast_weights()` and the backtest's print
+summary then averaged each method over its **own** dates, so a model that
+failed at a hard date looked better than it was and earned too much weight --
+silently.
+
+Now the default `nowcast_weights(type = "inverse_score")`, `type = "optim"`,
+the print summary, and `nowcast_ensemble()`'s performance weights keep only the
+targets (`now` date, event date, stratum) that every method scored, and warn
+naming each method and date whose rows were dropped. Weights and summaries from
+a backtest with a failed fit therefore change. The new `common_dates = TRUE`
+argument of `nowcast_weights()`, `nowcast_ensemble()` and `print()` restores
+the previous per-method averages with `common_dates = FALSE`. Backtests in
+which every fit succeeded are unaffected.
+
+## `nowcast_backtest()` can run its fits in parallel (experimental)
+
+`nowcast_backtest()` gains `parallel = FALSE`. With `parallel = TRUE`, every
+(engine, date) fit runs as a \pkg{future} task through \pkg{foreach} and
+\pkg{doFuture}, on whatever backend `future::plan()` sets (#92). The result
+has the same rows in the same order as a sequential run, and with `seed` the
+same values. The option is experimental and may not play well with Stan-based
+engines such as `engine_epinowcast()` and `engine_epinow2()`, which already
+parallelise their chains; the sequential path is unchanged.
+
+## Covariates can be tagged by model component
+
+`tbl_now()` now records which declared covariates belong to the event process,
+the report process or the revision process. A covariate can be tagged
+in several places -- for example, `location` can be both an event covariate and
+a report covariate -- without duplicating the column.
+
+Use `event_covariates`, `report_covariates` and `revision_covariates` in
+`tbl_now()`, or edit them later with the new
+`add_*_covariates()`, `change_*_covariates()`,
+`remove_*_covariates()` and `get_*_covariates()` helpers. Printing a
+`tbl_now` now reports the component tags.
+
+Declared covariates with no explicit role default to event covariates, keeping
+the historical meaning of `covariates = ...`.
+
+`engine_epinowcast()` carries event and report covariates through
+`tbl_now_to_epinowcast()` and wires them into default `expectation` and
+`reference` modules when those modules are not supplied explicitly. Explicit
+epinowcast modules are left untouched and warn that the tagged covariates must
+be included by the caller. `engine_diseasenowcasting()` receives the same
+role-tagged `tbl_now` attributes directly.
+
 # tbl.now 1.0.0
 
 ## `example_engine()` no longer emits duplicate prediction rows
@@ -473,7 +620,7 @@ sharing estimates across strata and drops an internal wrapper class.
 
 * **New**: `engine_baselinenowcast(strata_sharing = )` -- passed straight
   through to `baselinenowcast::baselinenowcast()`. `"none"` (default) fits
-  every stratum independently; `"delay"` shares the delay PMF across strata;
+  every stratum independently; `"report"` shares the delay PMF across strata;
   `"uncertainty"` shares the uncertainty parameters; both can be combined.
   Meaningful only when the object has strata.
 * **New default**: `tbl_now_to_baselinenowcast(format = "auto")` -- returns a
@@ -2021,7 +2168,7 @@ the class exists to carry. One row is one statistic of one quantity of one
 stratum:
 
 ```r
-summary(dengue_now) |> dplyr::filter(component == "delay")
+summary(dengue_now) |> dplyr::filter(component == "report")
 ```
 
 It covers the case counts on each of the object's time axes (event, report and,

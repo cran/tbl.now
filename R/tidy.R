@@ -848,7 +848,7 @@ tidy.estimate_truncation <- function(x, probs = NULL, ...) {
 #' @section How `mean` and `sd` are obtained:
 #'
 #' \pkg{epidist} reports continuous-distribution moments via
-#' `epidist::add_mean_sd()`.
+#' `epidist::add_summaries()`.
 #'
 #' \pkg{EpiNow2} gets them without naming a distribution. It can fit five
 #' families today and may add more, and a `switch()` in this package would
@@ -884,7 +884,7 @@ tidy.estimate_truncation <- function(x, probs = NULL, ...) {
 #'   `q*` column each.
 #' @param level Width of the reported interval. Defaults to `0.95`.
 #' @param newdata `tidy.epidist_fit()` only. Optional data frame passed to
-#'   [epidist::predict_delay_parameters()], for a fit with covariates in the
+#'   [epidist::delay_parameter_draws()], for a fit with covariates in the
 #'   delay model (`formula = mu ~ 1 + gender`, say). `NULL` uses the fit's own
 #'   data.
 #' @param ... Unused, for generic consistency.
@@ -1119,24 +1119,30 @@ tidy.epidist_fit <- function(x, probs = NULL, level = 0.95, newdata = NULL,
   }
 
   # Draws of the delay parameters, one row per draw per observation.
-  # `add_mean_sd()` appends the summaries of the distribution those parameters
-  # imply, which is what a reader actually wants to read off a delay fit.
-  draws <- epidist::predict_delay_parameters(x, newdata = newdata)
-  draws <- epidist::add_mean_sd(draws)
+  # `add_summaries()` appends the mean and sd of the distribution those
+  # parameters imply, which is what a reader actually wants to read off a delay
+  # fit.
+  draws <- epidist::delay_parameter_draws(x, newdata = newdata)
+  family <- attr(draws, "epidist_family")
+  draws <- dplyr::ungroup(epidist::add_summaries(draws))
 
-  # Everything except the bookkeeping columns is a parameter worth reporting.
-  # epidist's marginal model carries `n` / `weight` on the aggregate path, and
-  # `predict_delay_parameters()` may append `.observation` / `.row`; neither is a
-  # delay parameter but both are numeric, so they leak into the output as bogus
-  # "parameters" without this filter. Add here whenever epidist ships a new one.
-  bookkeeping <- c(
-    "draw", "index", ".draw", ".chain", ".iteration", ".observation", ".row",
-    "obs", "n", "weight"
-  )
-  terms <- setdiff(names(draws), bookkeeping)
-  terms <- terms[vapply(draws[terms], is.numeric, logical(1))]
+  # `delay_parameter_draws()` binds every column of the prediction data in front
+  # of the draws -- `delay_lwr`, `relative_obs_time`, `n` and the like, all
+  # numeric -- so the parameters are read off the family epidist records rather
+  # than guessed from what is left. The blocklist is the fallback for draws that
+  # carry no family.
+  terms <- if (!is.null(family$dpars)) {
+    intersect(c(family$dpars, "mean", "sd"), names(draws))
+  } else {
+    bookkeeping <- c(
+      "draw", "index", ".draw", ".chain", ".iteration", ".observation", ".row",
+      "obs", "n", "weight", names(newdata %||% x$data)
+    )
+    candidates <- setdiff(names(draws), bookkeeping)
+    candidates[vapply(draws[candidates], is.numeric, logical(1))]
+  }
 
-  # `predict_delay_parameters()` returns one row per draw x OBSERVATION, and the
+  # `delay_parameter_draws()` returns one row per draw x OBSERVATION, and the
   # quantiles below pool over both. For an intercept-only delay model every
   # observation shares the draw's value, so that pooling is exactly the posterior
   # interval. With covariates in the delay model (`formula = mu ~ 1 + gender`)
@@ -1180,7 +1186,7 @@ tidy.epidist_fit <- function(x, probs = NULL, level = 0.95, newdata = NULL,
 #' Checking one draw is enough, and keeps this O(n_obs) rather than O(n_draws x
 #' n_obs).
 #'
-#' @param draws The data frame from [epidist::predict_delay_parameters()].
+#' @param draws The data frame from [epidist::delay_parameter_draws()].
 #' @param terms Character vector of the parameter columns being summarised.
 #'
 #' @return `NULL`, invisibly.
